@@ -1,0 +1,817 @@
+import { Palette, ProgressIndicator, ScrollView, Switch } from "std-widgets.slint";
+
+export struct LogLine {
+    text: string,
+    error: bool,
+}
+
+// One design language: opaque content, one accent, concentric radii,
+// hairlines and soft shadows. Only the dialog floats.
+global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> canvas: dark ? #25272b : #f5f6f8;
+    out property <color> surface: dark ? #2d3035 : #ffffff;
+    out property <color> surface-alt: dark ? #33373d : #f0f2f5;
+    out property <color> text: Palette.foreground;
+    out property <color> text-2: dark ? #ffffffc4 : #0000009e;
+    out property <color> text-3: dark ? #ffffff85 : #0000006b;
+    out property <color> stroke: dark ? #ffffff18 : #00000012;
+    out property <color> hover: dark ? #ffffff0d : #00000008;
+    out property <color> pressed: dark ? #ffffff16 : #0000000f;
+    out property <color> accent: Palette.accent-background;
+    out property <color> on-accent: Palette.accent-foreground;
+    out property <color> accent-soft: Palette.accent-background.transparentize(0.86);
+    out property <color> success: dark ? #7bd88a : #167c33;
+    out property <color> warning: dark ? #f5c84c : #8a5a00;
+    out property <color> danger: dark ? #ff9aa2 : #c02b2b;
+    out property <color> danger-soft: dark ? #4a292a : #fdecec;
+    out property <color> scrim: dark ? #000000a6 : #00000052;
+}
+
+component Card inherits Rectangle {
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.stroke;
+    border-radius: 14px;
+    vertical-stretch: 0;
+}
+
+component Section inherits VerticalLayout {
+    in property <string> title;
+    spacing: 8px;
+    vertical-stretch: 0;
+
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-size: 15px;
+        font-weight: 700;
+        vertical-stretch: 0;
+    }
+
+    @children
+}
+
+component RowLabel inherits Text {
+    color: Theme.text-2;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+}
+
+component RowValue inherits Text {
+    color: Theme.text;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    overflow: elide;
+}
+
+component FlatButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    min-height: 36px;
+    min-width: 88px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 10px;
+    border-width: root.primary ? 0px : 1px;
+    border-color: root.danger ? Theme.danger.transparentize(0.55) : Theme.stroke;
+    background: !root.enabled
+        ? (root.primary ? Theme.accent.transparentize(0.55) : transparent)
+        : root.primary
+            ? Theme.accent
+            : touch.pressed
+                ? Theme.pressed
+                : touch.has-hover
+                    ? Theme.hover
+                    : root.danger
+                        ? Theme.danger-soft
+                        : transparent;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+
+        Text {
+            text: root.label;
+            color: root.primary ? Theme.on-accent : root.danger ? Theme.danger : Theme.text;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            opacity: root.enabled ? 1.0 : 0.5;
+        }
+    }
+}
+
+component Chevron inherits Path {
+    in property <bool> up;
+    width: 10px;
+    height: 10px;
+    viewbox-width: 10;
+    viewbox-height: 10;
+    commands: root.up ? "M 1.5 6.5 L 5 3 L 8.5 6.5" : "M 1.5 3.5 L 5 7 L 8.5 3.5";
+    stroke-width: 1.25px;
+}
+
+component LogToggle inherits Rectangle {
+    in property <bool> expanded;
+    callback clicked();
+
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    min-height: 32px;
+    border-radius: 8px;
+    background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    accessible-role: button;
+    accessible-label: label.text;
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        label := Text {
+            text: root.expanded ? "Hide log" : "Show log";
+            color: Theme.text-2;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Chevron {
+                up: root.expanded;
+                stroke: Theme.text-2;
+            }
+        }
+    }
+}
+
+component OptionRow inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    vertical-stretch: 0;
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 20px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-weight: 500;
+            }
+
+            Text {
+                text: root.description;
+                color: Theme.text-2;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            @children
+        }
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    vertical-stretch: 0;
+    background: Theme.stroke;
+}
+
+component ErrorIcon inherits Rectangle {
+    width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    background: Theme.danger;
+
+    Path {
+        width: 16px;
+        height: 16px;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        commands: "M 5.5 5.5 L 10.5 10.5 M 10.5 5.5 L 5.5 10.5";
+        stroke: Theme.dark ? #000000 : #ffffff;
+        stroke-width: 1.5px;
+    }
+}
+
+component LogPanel inherits Rectangle {
+    in property <[LogLine]> lines;
+    in property <string> font-family;
+    property <bool> follow: true;
+
+    background: Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.stroke;
+    border-radius: 14px;
+    clip: true;
+
+    function stick() {
+        if (root.follow) {
+            scroll.content-y = min(0px, scroll.visible-height - scroll.content-height);
+        }
+    }
+
+    scroll := ScrollView {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: parent.height - 2px;
+
+        changed content-height => {
+            root.stick();
+        }
+        changed visible-height => {
+            root.stick();
+        }
+        scrolled => {
+            root.follow = self.content-y <= self.visible-height - self.content-height + 8px;
+        }
+
+        VerticalLayout {
+            alignment: start;
+            padding: 14px;
+            spacing: 2px;
+
+            for line in root.lines: Text {
+                text: line.text;
+                color: line.error ? Theme.danger : Theme.text-2;
+                font-family: root.font-family;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    if root.lines.length == 0: Text {
+        text: "Nothing logged yet.";
+        color: Theme.text-3;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "FL Studio";
+    icon: @image-url("../packaging/fl-studio-linux.svg");
+    default-font-size: 14px;
+    background: Theme.canvas;
+    min-width: 560px;
+    preferred-width: 700px;
+    min-height: page.min-height;
+    preferred-height: page.preferred-height;
+
+    in-out property <string> state-text: "Checking…";
+    in-out property <string> status-text;
+    in-out property <string> error-text;
+    in-out property <string> distro-text: "Checking…";
+    in-out property <string> gpu-text: "Checking…";
+    in-out property <string> wine-text: "Checking…";
+    in-out property <string> deps-text: "Checking…";
+    in-out property <string> webview-text: "Checking…";
+    in-out property <string> prefix-text;
+    in-out property <[LogLine]> logs;
+    // Slint only resolves named families, so Rust fills in the system monospace font.
+    in property <string> mono-font: "DejaVu Sans Mono";
+    in property <bool> installed;
+    in property <bool> busy;
+    in property <bool> deps-ok: true;
+    in-out property <bool> dxvk-enabled;
+    in-out property <bool> fonts-enabled;
+    in-out property <bool> details-open;
+    in-out property <bool> confirm-open;
+    // Height that fits the content exactly; used to shrink the window when the log closes.
+    out property <length> fit-height: page.preferred-height;
+
+    callback install-clicked();
+    callback launch-clicked();
+    callback update-clicked();
+    callback repair-clicked();
+    callback uninstall-clicked();
+    callback details-toggled();
+    callback options-changed();
+
+    property <bool> failed: !root.busy && root.error-text != "";
+    property <string> headline: root.busy && root.status-text != "" ? root.status-text : root.state-text;
+    property <color> dot-color: root.busy ? Theme.accent : root.failed ? Theme.danger : root.installed ? Theme.success : Theme.text-3;
+
+    function toggle-log() {
+        root.details-open = !root.details-open;
+        root.details-toggled();
+    }
+
+    page := VerticalLayout {
+        x: (root.width - self.width) / 2;
+        width: min(root.width, 860px);
+        height: root.height;
+        // Only the log grows; otherwise content stays at the top.
+        alignment: root.details-open ? LayoutAlignment.stretch : LayoutAlignment.start;
+        padding-left: 24px;
+        padding-right: 24px;
+        padding-top: 20px;
+        padding-bottom: 24px;
+        spacing: 20px;
+
+        HorizontalLayout {
+            spacing: 14px;
+            vertical-stretch: 0;
+
+            Image {
+                source: @image-url("../packaging/fl-studio-linux.svg");
+                width: 42px;
+                height: 42px;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 2px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    vertical-stretch: 0;
+
+                    Text {
+                        text: "FL Studio";
+                        color: Theme.text;
+                        font-size: 22px;
+                        font-weight: 750;
+                    }
+
+                    Rectangle {
+                        width: 1px;
+                        height: 18px;
+                        background: Theme.stroke;
+                    }
+
+                    Text {
+                        text: "Linux";
+                        color: Theme.text-2;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 8px;
+
+                        Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: root.dot-color;
+                        }
+                    }
+
+                    Text {
+                        text: root.headline;
+                        color: root.failed ? Theme.danger : Theme.text-2;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+
+                FlatButton {
+                    primary: true;
+                    min-width: 118px;
+                    label: root.busy ? root.state-text : root.installed ? "Open" : "Install";
+                    enabled: !root.busy;
+                    clicked => {
+                        if (root.installed) {
+                            root.launch-clicked();
+                        } else {
+                            root.install-clicked();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Divider that turns into a progress bar while a job runs, without shifting the layout.
+        Rectangle {
+            height: 3px;
+            vertical-stretch: 0;
+
+            if !root.busy: Rectangle {
+                y: 1px;
+                height: 1px;
+                background: Theme.stroke;
+            }
+
+            if root.busy: ProgressIndicator {
+                width: parent.width;
+                height: parent.height;
+                indeterminate: true;
+            }
+        }
+
+        if root.failed: Rectangle {
+            vertical-stretch: 0;
+            background: Theme.danger-soft;
+            border-width: 1px;
+            border-color: Theme.danger.transparentize(0.7);
+            border-radius: 14px;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 2px;
+                    ErrorIcon { }
+                }
+
+                Text {
+                    text: root.error-text;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+
+                if !root.details-open: VerticalLayout {
+                    alignment: center;
+                    FlatButton {
+                        label: "Show log";
+                        clicked => {
+                            root.toggle-log();
+                        }
+                    }
+                }
+            }
+        }
+
+        if !root.installed && !root.busy && !root.failed: Rectangle {
+            vertical-stretch: 0;
+            background: Theme.accent-soft;
+            border-radius: 14px;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 14px;
+                padding-bottom: 14px;
+                spacing: 12px;
+
+                Text {
+                    text: "Installs the official Windows build through a private Wine prefix. Sign in with your Image-Line account inside FL Studio to unlock it.";
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Section {
+            title: "System";
+
+            Card {
+                VerticalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "Distribution";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.distro-text;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "Graphics";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.gpu-text;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "Wine";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.wine-text;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "Dependencies";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.deps-text;
+                            color: root.deps-ok ? Theme.text : Theme.warning;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "WebView2";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.webview-text;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
+                            text: "Location";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.prefix-text;
+                        }
+                    }
+                }
+            }
+        }
+
+        Section {
+            title: "Options";
+
+            Card {
+                VerticalLayout {
+                    OptionRow {
+                        title: "Microsoft fonts";
+                        description: "Arial, Verdana and musical symbols. FLEX needs them.";
+
+                        Switch {
+                            horizontal-stretch: 0;
+                            checked <=> root.fonts-enabled;
+                            enabled: !root.busy;
+                            toggled => {
+                                root.options-changed();
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    OptionRow {
+                        title: "DXVK";
+                        description: "Faster Direct3D plugins. Can affect WebView2 panes.";
+
+                        Switch {
+                            horizontal-stretch: 0;
+                            checked <=> root.dxvk-enabled;
+                            enabled: !root.busy;
+                            toggled => {
+                                root.options-changed();
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: "Changes apply the next time you install or repair.";
+                color: Theme.text-3;
+                font-size: 12px;
+                vertical-stretch: 0;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            vertical-stretch: 0;
+
+            if root.installed: HorizontalLayout {
+                spacing: 8px;
+
+                FlatButton {
+                    label: "Update";
+                    enabled: !root.busy;
+                    clicked => {
+                        root.update-clicked();
+                    }
+                }
+
+                FlatButton {
+                    label: "Repair";
+                    enabled: !root.busy;
+                    clicked => {
+                        root.repair-clicked();
+                    }
+                }
+
+                FlatButton {
+                    label: "Uninstall";
+                    danger: true;
+                    enabled: !root.busy;
+                    clicked => {
+                        root.confirm-open = true;
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            LogToggle {
+                expanded: root.details-open;
+                clicked => {
+                    root.toggle-log();
+                }
+            }
+        }
+
+        if root.details-open: LogPanel {
+            min-height: 140px;
+            preferred-height: 220px;
+            vertical-stretch: 1;
+            lines: root.logs;
+            font-family: root.mono-font;
+        }
+
+        Text {
+            text: "Unofficial. FL Studio is a trademark of Image-Line.";
+            color: Theme.text-3;
+            font-size: 11px;
+            vertical-stretch: 0;
+        }
+    }
+
+    if root.confirm-open: FocusScope {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        init => {
+            self.focus();
+        }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.confirm-open = false;
+                return accept;
+            }
+            return reject;
+        }
+
+        Rectangle {
+            background: Theme.scrim;
+        }
+
+        // Swallows clicks so the page underneath stays inert.
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(460px, parent.width - 48px);
+            height: dialog.preferred-height;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.stroke;
+            border-radius: 18px;
+            drop-shadow-blur: 40px;
+            drop-shadow-offset-y: 12px;
+            drop-shadow-color: #00000055;
+
+            dialog := VerticalLayout {
+                padding: 1px;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "Uninstall FL Studio?";
+                        color: Theme.text;
+                        font-size: 20px;
+                        font-weight: 750;
+                    }
+
+                    Text {
+                        text: "This deletes " + root.prefix-text + ", including Wine and FL Studio, and removes the menu entries. Projects and samples saved outside this folder are kept.";
+                        color: Theme.text;
+                        wrap: word-wrap;
+                    }
+                }
+
+                Rectangle {
+                    background: Theme.surface-alt;
+                    border-bottom-left-radius: 17px;
+                    border-bottom-right-radius: 17px;
+
+                    HorizontalLayout {
+                        padding: 16px;
+                        spacing: 8px;
+                        alignment: end;
+
+                        FlatButton {
+                            label: "Uninstall";
+                            danger: true;
+                            clicked => {
+                                root.confirm-open = false;
+                                root.uninstall-clicked();
+                            }
+                        }
+
+                        FlatButton {
+                            label: "Cancel";
+                            primary: true;
+                            clicked => {
+                                root.confirm-open = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

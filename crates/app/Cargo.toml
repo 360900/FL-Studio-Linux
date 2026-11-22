@@ -1,0 +1,17 @@
+[package]
+name = "fl-studio-linux-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fl-studio-linux-gui"
+path = "src/main.rs"
+
+[dependencies]
+fl-studio-linux-core = { path = "../core" }
+anyhow.workspace = true
+slint = { workspace = true, features = ["unstable-winit-030"] }
+
+[build-dependencies]
+slint-build.workspace = true

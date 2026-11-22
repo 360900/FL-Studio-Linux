@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FL Studio Linux
+Comment=Install, update and repair FL Studio
+Exec=fl-studio-linux-gui
+Icon=fl-studio-linux
+Terminal=false
+Categories=Utility;

@@ -1,0 +1,49 @@
+[package]
+name = "fl-studio-linux"
+version.workspace = true
+repository = "https://github.com/360900/FL-Studio-Linux"
+description = "Installer and launcher for FL Studio on Linux"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fl-studio-linux"
+path = "src/main.rs"
+
+[dependencies]
+fl-studio-linux-core = { path = "../core" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+
+[package.metadata.deb]
+name = "fl-studio-linux"
+maintainer = "360900 <ziyad.koca@hotmail.com>"
+extended-description = "Installs and launches FL Studio on Linux through Wine."
+section = "utils"
+depends = "$auto, libxkbcommon0, libegl1"
+assets = [
+    ["target/release/fl-studio-linux", "usr/bin/", "755"],
+    ["target/release/fl-studio-linux-gui", "usr/bin/", "755"],
+    ["../../packaging/io.github._360900.FLStudioLinux.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/fl-studio-linux.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/io.github._360900.FLStudioLinux.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../README.md", "usr/share/doc/fl-studio-linux/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "fl-studio-linux"
+assets = [
+    { source = "target/release/fl-studio-linux", dest = "/usr/bin/fl-studio-linux", mode = "755" },
+    { source = "target/release/fl-studio-linux-gui", dest = "/usr/bin/fl-studio-linux-gui", mode = "755" },
+    { source = "../../packaging/io.github._360900.FLStudioLinux.desktop", dest = "/usr/share/applications/io.github._360900.FLStudioLinux.desktop", mode = "644" },
+    { source = "../../packaging/fl-studio-linux.svg", dest = "/usr/share/icons/hicolor/scalable/apps/fl-studio-linux.svg", mode = "644" },
+    { source = "../../packaging/io.github._360900.FLStudioLinux.metainfo.xml", dest = "/usr/share/metainfo/io.github._360900.FLStudioLinux.metainfo.xml", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/fl-studio-linux/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+"libxkbcommon.so.0()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"

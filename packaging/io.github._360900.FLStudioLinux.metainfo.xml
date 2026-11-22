@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github._360900.FLStudioLinux</id>
+  <name>FL Studio Linux</name>
+  <summary>Install, update and repair FL Studio on Linux</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.360900">
+    <name>360900</name>
+  </developer>
+  <description>
+    <p>
+      One-click installer and launcher for FL Studio on Linux. Handles system
+      dependencies, a private Wine build, Microsoft fonts, plugin runtimes,
+      optional DXVK, WebView2 fixes and the desktop integration, then keeps the
+      install healthy with repair, update and uninstall.
+    </p>
+    <p>
+      FL Studio is proprietary software. Sign in with your Image-Line account
+      to unlock it. This project is not affiliated with Image-Line.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github._360900.FLStudioLinux.desktop</launchable>
+  <url type="homepage">https://github.com/360900/FL-Studio-Linux</url>
+  <url type="bugtracker">https://github.com/360900/FL-Studio-Linux/issues</url>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <provides>
+    <binary>fl-studio-linux</binary>
+    <binary>fl-studio-linux-gui</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-22"/>
+  </releases>
+</component>
