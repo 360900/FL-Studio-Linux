@@ -24,7 +24,7 @@ jobs:
           dir=fl-studio-linux-${GITHUB_REF_NAME#v}-x86_64
           mkdir -p $dir/target/release
           cp target/release/fl-studio-linux target/release/fl-studio-linux-gui $dir/target/release/
-          cp -r Makefile LICENSE README.md packaging $dir/
+          cp -r Makefile LICENSE README.md THIRD_PARTY_NOTICES.md packaging vendor $dir/
           tar czf $dir.tar.gz $dir
       - name: publish
         env:

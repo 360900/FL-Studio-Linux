@@ -18,6 +18,8 @@ install:
 	install -Dm644 packaging/fl-studio-linux.svg $(ICONDIR)/fl-studio-linux.svg
 	install -Dm644 packaging/io.github._360900.FLStudioLinux.metainfo.xml $(METADIR)/io.github._360900.FLStudioLinux.metainfo.xml
 	install -Dm644 LICENSE $(LICDIR)/LICENSE
+	install -Dm644 THIRD_PARTY_NOTICES.md $(LICDIR)/THIRD_PARTY_NOTICES.md
+	install -Dm644 vendor/winepipe/LICENSE $(LICDIR)/WinePipe-LICENSE
 
 uninstall:
 	rm -f $(BINDIR)/fl-studio-linux $(BINDIR)/fl-studio-linux-gui
