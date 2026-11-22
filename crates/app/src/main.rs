@@ -8,7 +8,6 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
-use fl_studio_linux_core::audio::AudioDriver;
 use fl_studio_linux_core::config::{Config, default_prefix};
 use fl_studio_linux_core::deps;
 use fl_studio_linux_core::doctor::{self, DoctorReport};
@@ -42,9 +41,6 @@ fn main() -> Result<(), slint::PlatformError> {
     let logs: Rc<VecModel<LogLine>> = Rc::new(VecModel::from(Vec::new()));
     ui.set_logs(logs.clone().into());
     ui.set_prefix_text(display_path(&cfg.prefix).into());
-    ui.set_dxvk_enabled(cfg.dxvk);
-    ui.set_fonts_enabled(cfg.fonts);
-    ui.set_audio_index(cfg.audio.index());
     if let Some(family) = monospace_family() {
         ui.set_mono_font(family.into());
     }
@@ -63,10 +59,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
-            let options = selected_options(&ui);
             let display = display_info(&ui);
             start_job(&ui, "Installing…");
-            spawn_install(cfg, options, display, tx.clone());
+            spawn_install(cfg, display, tx.clone());
         });
     }
     {
@@ -105,10 +100,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
-            let options = selected_options(&ui);
             let display = display_info(&ui);
             start_job(&ui, "Repairing…");
-            spawn_repair(cfg, options, display, tx.clone());
+            spawn_repair(cfg, display, tx.clone());
         });
     }
     {
@@ -122,20 +116,6 @@ fn main() -> Result<(), slint::PlatformError> {
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             start_job(&ui, "Uninstalling…");
             spawn_uninstall(cfg, tx.clone());
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let cfg = cfg.clone();
-        ui.on_options_changed(move || {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let mut saved = Config::load().unwrap_or_else(|_| cfg.clone());
-            saved.dxvk = ui.get_dxvk_enabled();
-            saved.fonts = ui.get_fonts_enabled();
-            saved.audio = AudioDriver::from_index(ui.get_audio_index());
-            let _ = saved.save();
         });
     }
     {
@@ -212,21 +192,6 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     ui.run()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SelectedOptions {
-    dxvk: bool,
-    fonts: bool,
-    audio: AudioDriver,
-}
-
-fn selected_options(ui: &MainWindow) -> SelectedOptions {
-    SelectedOptions {
-        dxvk: ui.get_dxvk_enabled(),
-        fonts: ui.get_fonts_enabled(),
-        audio: AudioDriver::from_index(ui.get_audio_index()),
-    }
 }
 
 /// The monitor's physical resolution, if known, and the window's scale factor.
@@ -374,7 +339,7 @@ fn default_elevation() -> Elevation {
     }
 }
 
-fn spawn_install(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx: Sender<UiEvent>) {
+fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "install");
@@ -403,9 +368,9 @@ fn spawn_install(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx
                 &SetupOptions {
                     prefix: prefix.clone(),
                     installer: None,
-                    dxvk: options.dxvk,
-                    fonts: options.fonts,
-                    audio: options.audio,
+                    dxvk: cfg.dxvk,
+                    fonts: cfg.fonts,
+                    audio: cfg.audio,
                     dpi: Some(dpi),
                     dry_run: false,
                     log_path: Some(log_path.clone()),
@@ -418,11 +383,6 @@ fn spawn_install(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx
                 let _ = prefetch.join();
             }
             let _ = report?;
-            let mut saved = cfg.clone();
-            saved.dxvk = options.dxvk;
-            saved.fonts = options.fonts;
-            saved.audio = options.audio;
-            saved.save()?;
             Ok(())
         })();
         match result {
@@ -489,7 +449,7 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     });
 }
 
-fn spawn_repair(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx: Sender<UiEvent>) {
+fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "repair");
@@ -506,9 +466,9 @@ fn spawn_repair(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx:
                 &SetupOptions {
                     prefix: prefix.clone(),
                     installer: None,
-                    dxvk: options.dxvk,
-                    fonts: options.fonts,
-                    audio: options.audio,
+                    dxvk: cfg.dxvk,
+                    fonts: cfg.fonts,
+                    audio: cfg.audio,
                     dpi: Some(dpi),
                     dry_run: false,
                     log_path: Some(log_path.clone()),
@@ -517,11 +477,6 @@ fn spawn_repair(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx:
                 },
                 &mut send,
             )?;
-            let mut saved = cfg.clone();
-            saved.dxvk = options.dxvk;
-            saved.fonts = options.fonts;
-            saved.audio = options.audio;
-            saved.save()?;
             Ok(())
         })();
         match result {
@@ -681,17 +636,11 @@ fn apply_report(
     } else {
         "Not installed".to_string()
     };
-    let audio = report
-        .audio_driver
-        .clone()
-        .unwrap_or_else(|| "Off".to_string());
-
     ui.set_distro_text(distro.into());
     ui.set_gpu_text(gpu.into());
     ui.set_deps_text(deps.into());
     ui.set_deps_ok(missing.is_empty() && has_download);
     ui.set_wine_text(wine.clone().into());
-    ui.set_audio_text(audio.clone().into());
     ui.set_webview_text(webview.clone().into());
     ui.set_prefix_text(display_path(&report.prefix).into());
     ui.set_installed(report.installed);

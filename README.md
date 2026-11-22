@@ -7,10 +7,6 @@ Wine prefix, installs the official Windows build from Image-Line, adds the
 fonts and plugin runtimes FL Studio expects, applies the WebView2 workarounds
 and creates a menu entry that always launches the right environment.
 
-Not affiliated with or endorsed by Image-Line. FL Studio is proprietary
-software; the installer downloads the official trial and you unlock it with
-your Image-Line account.
-
 ## Features
 
 - Private Wine 11.22 build (Kron4ek) with Wine 11.21 as a fallback. FL Studio
@@ -117,12 +113,10 @@ inside FL Studio to unlock a paid edition.
   the EXE directly would let the system Wine handle it and break WebView2 and
   DXVK isolation.
 - DXVK is on by default and maps Direct3D to Vulkan. If a plugin or the
-  WebView2 panes misbehave, turn Hardware acceleration off in Options and run
-  Repair.
+  WebView2 panes misbehave, run `fl-studio-linux repair --dxvk false`.
 - WinePipe is the low-latency driver and talks to PipeWire directly. It is
-  installed into the private Wine build and selected in FL Studio
-  automatically. Change it in Options or in `Options > Audio settings` in FL
-  Studio.
+  installed and selected in FL Studio automatically. Change it with `--audio`
+  or in `Options > Audio settings` in FL Studio.
 - FL Studio disables PipeWire's internal `PipeWire-System`,
   `PipeWire-RT-Event` and `Midi Through` inputs during install. If no hardware
   MIDI controller is connected, MIDI input is also turned off so FL does not
@@ -143,7 +137,6 @@ inside FL Studio to unlock a paid edition.
 - Run the installer as your normal user. It asks for elevation only when it
   installs system packages; running the whole app with `sudo` would create the
   prefix and menu entries in root's home.
-- FL Studio is not officially supported on Linux. Keep project backups.
 
 ## Files
 

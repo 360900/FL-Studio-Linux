@@ -1,4 +1,4 @@
-import { ComboBox, Palette, ProgressIndicator, ScrollView, Switch } from "std-widgets.slint";
+import { Palette, ProgressIndicator, ScrollView } from "std-widgets.slint";
 
 export struct LogLine {
     text: string,
@@ -166,51 +166,6 @@ component LogToggle inherits Rectangle {
     }
 }
 
-component OptionRow inherits Rectangle {
-    in property <string> title;
-    in property <string> description;
-    vertical-stretch: 0;
-    background: transparent;
-
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
-        padding-top: 12px;
-        padding-bottom: 12px;
-        spacing: 20px;
-
-        VerticalLayout {
-            alignment: center;
-            spacing: 3px;
-
-            Text {
-                text: root.title;
-                color: Theme.text;
-                font-weight: 500;
-            }
-
-            Text {
-                text: root.description;
-                color: Theme.text-2;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
-        }
-
-        VerticalLayout {
-            alignment: center;
-            horizontal-stretch: 0;
-            @children
-        }
-    }
-}
-
-component Divider inherits Rectangle {
-    height: 1px;
-    vertical-stretch: 0;
-    background: Theme.stroke;
-}
-
 component ErrorIcon inherits Rectangle {
     width: 16px;
     height: 16px;
@@ -300,7 +255,6 @@ export component MainWindow inherits Window {
     in-out property <string> distro-text: "Checking…";
     in-out property <string> gpu-text: "Checking…";
     in-out property <string> wine-text: "Checking…";
-    in-out property <string> audio-text: "Checking…";
     in-out property <string> deps-text: "Checking…";
     in-out property <string> webview-text: "Checking…";
     in-out property <string> prefix-text;
@@ -310,9 +264,6 @@ export component MainWindow inherits Window {
     in property <bool> installed;
     in property <bool> busy;
     in property <bool> deps-ok: true;
-    in-out property <bool> dxvk-enabled;
-    in-out property <bool> fonts-enabled;
-    in-out property <int> audio-index: 0;
     in-out property <bool> details-open;
     in-out property <bool> confirm-open;
     // Height that fits the content exactly; used to shrink the window when the log closes.
@@ -324,7 +275,6 @@ export component MainWindow inherits Window {
     callback repair-clicked();
     callback uninstall-clicked();
     callback details-toggled();
-    callback options-changed();
 
     property <bool> failed: !root.busy && root.error-text != "";
     property <string> headline: root.busy && root.status-text != "" ? root.status-text : root.state-text;
@@ -372,19 +322,6 @@ export component MainWindow inherits Window {
                         color: Theme.text;
                         font-size: 22px;
                         font-weight: 750;
-                    }
-
-                    Rectangle {
-                        width: 1px;
-                        height: 18px;
-                        background: Theme.stroke;
-                    }
-
-                    Text {
-                        text: "Linux";
-                        color: Theme.text-2;
-                        font-size: 15px;
-                        vertical-alignment: center;
                     }
                 }
 
@@ -575,23 +512,6 @@ export component MainWindow inherits Window {
                         spacing: 24px;
 
                         RowLabel {
-                            text: "Audio";
-                            width: 132px;
-                        }
-
-                        RowValue {
-                            text: root.audio-text;
-                        }
-                    }
-
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-top: 10px;
-                        padding-bottom: 10px;
-                        spacing: 24px;
-
-                        RowLabel {
                             text: "Dependencies";
                             width: 132px;
                         }
@@ -636,68 +556,6 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-            }
-        }
-
-        Section {
-            title: "Options";
-
-            Card {
-                VerticalLayout {
-                    OptionRow {
-                        title: "Microsoft fonts";
-                        description: "Required by FLEX and the WebView2 panes.";
-
-                        Switch {
-                            horizontal-stretch: 0;
-                            checked <=> root.fonts-enabled;
-                            enabled: !root.busy;
-                            toggled => {
-                                root.options-changed();
-                            }
-                        }
-                    }
-
-                    Divider { }
-
-                    OptionRow {
-                        title: "Hardware acceleration";
-                        description: "DXVK renders Direct3D through Vulkan.";
-
-                        Switch {
-                            horizontal-stretch: 0;
-                            checked <=> root.dxvk-enabled;
-                            enabled: !root.busy;
-                            toggled => {
-                                root.options-changed();
-                            }
-                        }
-                    }
-
-                    Divider { }
-
-                    OptionRow {
-                        title: "Low-latency audio";
-                        description: "WinePipe talks to PipeWire directly for low latency.";
-
-                        ComboBox {
-                            width: 220px;
-                            model: ["WinePipe (recommended)", "Off"];
-                            current-index <=> root.audio-index;
-                            enabled: !root.busy;
-                            selected => {
-                                root.options-changed();
-                            }
-                        }
-                    }
-                }
-            }
-
-            Text {
-                text: "Changes apply the next time you install or repair.";
-                color: Theme.text-3;
-                font-size: 12px;
-                vertical-stretch: 0;
             }
         }
 
@@ -754,12 +612,6 @@ export component MainWindow inherits Window {
             font-family: root.mono-font;
         }
 
-        Text {
-            text: "Unofficial. FL Studio is a trademark of Image-Line.";
-            color: Theme.text-3;
-            font-size: 11px;
-            vertical-stretch: 0;
-        }
     }
 
     if root.confirm-open: FocusScope {

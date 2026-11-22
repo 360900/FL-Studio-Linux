@@ -12,12 +12,8 @@
     <p>
       One-click installer and launcher for FL Studio on Linux. Handles system
       dependencies, a private Wine build, Microsoft fonts, plugin runtimes,
-      optional DXVK, WebView2 fixes and the desktop integration, then keeps the
-      install healthy with repair, update and uninstall.
-    </p>
-    <p>
-      FL Studio is proprietary software. Sign in with your Image-Line account
-      to unlock it. This project is not affiliated with Image-Line.
+      DXVK, WebView2 fixes and the desktop integration, then keeps the install
+      healthy with repair, update and uninstall.
     </p>
   </description>
   <launchable type="desktop-id">io.github._360900.FLStudioLinux.desktop</launchable>
