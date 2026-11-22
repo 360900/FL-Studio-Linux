@@ -102,9 +102,6 @@ fl-studio-linux uninstall
 `--dry-run` to preview changes and `--yes` to skip prompts. Hidden
 diagnostics: `doctor`, `deps`, `wine-setup`.
 
-The installation starts in trial mode. Sign in with your Image-Line account
-inside FL Studio to unlock a paid edition.
-
 ## Notes
 
 - FL Studio 26.1.4 and later need Wine 11.21 or newer. Do not switch the
