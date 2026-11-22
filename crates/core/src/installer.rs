@@ -269,6 +269,10 @@ fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
             "winemenubuilder.exe=d;winegstreamer=".into(),
         ),
         (
+            "WINEDLLPATH".into(),
+            wine_dir.join("lib/wine").display().to_string(),
+        ),
+        (
             "PATH".into(),
             format!("{}:{path}", wine_dir.join("bin").display()),
         ),

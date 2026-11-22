@@ -25,6 +25,7 @@ pub struct DoctorReport {
     pub prefix: PathBuf,
     pub prefix_exists: bool,
     pub wine_build: Option<String>,
+    pub audio_driver: Option<String>,
     pub installed: bool,
     pub fl_exe: Option<PathBuf>,
     pub webview2: bool,
@@ -78,6 +79,13 @@ pub fn run(cfg: &Config) -> DoctorReport {
             })
     });
 
+    let audio_driver = crate::config::read_prefix_state(&prefix, ".audio_driver")
+        .and_then(|label| crate::audio::AudioDriver::from_label(&label))
+        .map(|driver| driver.title().to_string())
+        .or_else(|| {
+            (cfg.audio != crate::audio::AudioDriver::None && prefix_exists)
+                .then(|| format!("{} (not installed)", cfg.audio.title()))
+        });
     let package_notes = packages::plan(&os).notes;
     let fl_exe = app_exe(&prefix);
     let installed = fl_exe.as_ref().is_some_and(|path| path.is_file())
@@ -98,6 +106,7 @@ pub fn run(cfg: &Config) -> DoctorReport {
         prefix,
         prefix_exists,
         wine_build,
+        audio_driver,
         installed,
         fl_exe,
         webview2: components::webview2_installed(&cfg.prefix),

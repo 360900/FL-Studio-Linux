@@ -19,6 +19,8 @@ use crate::runner::{self, RunOptions, Stream};
 
 const MSGOTHIC_URL: &str =
     "https://raw.githubusercontent.com/FSKiller/Microsoft-Fonts/main/msgothic.ttc";
+const WEBVIEW2_URL: &str = "https://go.microsoft.com/fwlink/?linkid=2124701";
+const WEBVIEW2_INSTALLER: &str = "MicrosoftEdgeWebView2RuntimeInstallerX64.exe";
 const MSGOTHIC_NAME: &str = "msgothic.ttc";
 const PLUGIN_RUNTIMES: &[&str] = &["vcrun2022", "gdiplus", "d3dcompiler_47"];
 const REQUIRED_FONTS: &[&str] = &["arialbd.ttf", "verdana.ttf"];
@@ -252,6 +254,79 @@ fn fonts_dir(prefix: &Path) -> PathBuf {
 pub fn fonts_present(prefix: &Path) -> bool {
     let fonts = fonts_dir(prefix);
     REQUIRED_FONTS.iter().all(|name| fonts.join(name).is_file())
+}
+
+/// Install Microsoft's Evergreen WebView2 runtime when FL Studio's own
+/// installer skipped it. It is required for the Sounds tab, Help and FL Cloud.
+pub fn install_webview2<F>(
+    prefix: &Path,
+    dry_run: bool,
+    log_path: Option<PathBuf>,
+    on_line: F,
+) -> Result<bool>
+where
+    F: FnMut(Stream, &str),
+{
+    let mut sink = on_line;
+    let mut report = Report::new(log_path, &mut sink);
+    report.info("Microsoft Edge WebView2 runtime");
+    if webview2_installed(prefix) && !dry_run {
+        report.info("WebView2 is already installed");
+        return Ok(true);
+    }
+    if dry_run {
+        let cached = http::cache_dir()?.join(WEBVIEW2_INSTALLER);
+        report.info(format!(
+            "    curl -fLR -z {0} -o {0} {WEBVIEW2_URL}",
+            cached.display()
+        ));
+        report.info(format!(
+            "    WINEPREFIX={} {}/bin/wine {} /silent /install",
+            prefix.display(),
+            prefix.join(WINE_DIR_NAME).display(),
+            cached.display()
+        ));
+        return Ok(true);
+    }
+    if !prefix.join(WINE_DIR_NAME).join("bin/wine").is_file() {
+        report.warn("skipping WebView2: Wine is missing");
+        return Ok(false);
+    }
+    let installer = match http::download_cached(
+        &mut report,
+        WEBVIEW2_URL,
+        WEBVIEW2_INSTALLER,
+        Duration::from_secs(900),
+    ) {
+        Ok(installer) => installer,
+        Err(error) => {
+            report.warn(format!("could not download WebView2: {error:#}"));
+            return Ok(false);
+        }
+    };
+    let wine_dir = prefix.join(WINE_DIR_NAME);
+    let wine = wine_dir.join("bin/wine");
+    kill_prefix(prefix, &wine_dir, &mut report)?;
+    let mut cmd = Command::new(&wine);
+    cmd.arg(&installer).args(["/silent", "/install"]);
+    let mut options = wine_env(prefix, &wine_dir);
+    options.stall_timeout = Some(Duration::from_secs(1800));
+    let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
+    // The bootstrapper can return before the runtime appears.
+    for _ in 0..150 {
+        if webview2_installed(prefix) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let _ = kill_prefix(prefix, &wine_dir, &mut report);
+    if webview2_installed(prefix) {
+        report.info("WebView2 installed");
+        Ok(true)
+    } else {
+        report.warn("WebView2 was not found after the installer finished");
+        Ok(false)
+    }
 }
 
 /// The installed WebView2 runtime, if FL Studio's installer managed to add it.

@@ -50,16 +50,21 @@ where
 
     let envs = launch_env(&opts.prefix, &wine_dir);
     let urls = opts.args.iter().any(|arg| is_url(arg));
-    let (target, args) = if urls {
+    // Always run FL Studio through the prefix's own Wine. Running the PE
+    // directly lets the kernel's binfmt handler pick the system Wine, which
+    // loses prefix isolation and breaks WebView2's GPU compositor.
+    let (program, args, display_target) = if urls {
         let mut args = vec!["start".to_string()];
         args.extend(opts.args.iter().cloned());
-        (wine, args)
+        (wine.clone(), args, wine)
     } else {
-        let args = convert_paths(&opts.prefix, &wine_dir, &opts.args);
-        (fl_exe.clone(), args)
+        let mut args = Vec::with_capacity(opts.args.len() + 1);
+        args.push(fl_exe.display().to_string());
+        args.extend(convert_paths(&opts.prefix, &wine_dir, &opts.args));
+        (wine.clone(), args, fl_exe.clone())
     };
 
-    let mut cmd = Command::new(&target);
+    let mut cmd = Command::new(&program);
     cmd.args(&args);
     if !urls && let Some(dir) = fl_exe.parent() {
         cmd.current_dir(dir);
@@ -75,24 +80,34 @@ where
     }
 
     if opts.dry_run {
-        report.info(format!("would run {} {}", target.display(), args.join(" ")));
+        report.info(format!(
+            "would run {} {}",
+            program.display(),
+            args.join(" ")
+        ));
         for (key, value) in &envs {
             report.info(format!("env {key}={value}"));
         }
-        return Ok(LaunchOutcome { target, args });
+        return Ok(LaunchOutcome {
+            target: display_target,
+            args,
+        });
     }
 
     // Keep Wine's errors: they are the only clue when a plugin crashes.
     attach_log(&mut cmd);
     let child = cmd
         .spawn()
-        .with_context(|| format!("starting {}", target.display()))?;
+        .with_context(|| format!("starting {}", program.display()))?;
     report.info(format!(
         "launched {} (pid {})",
-        target.display(),
+        display_target.display(),
         child.id()
     ));
-    Ok(LaunchOutcome { target, args })
+    Ok(LaunchOutcome {
+        target: display_target,
+        args,
+    })
 }
 
 fn is_url(arg: &str) -> bool {
@@ -112,11 +127,18 @@ fn convert_paths(prefix: &Path, wine_dir: &Path, args: &[String]) -> Vec<String>
 }
 
 fn windows_path(prefix: &Path, wine_dir: &Path, path: &Path) -> Option<String> {
+    let search_path = std::env::var("PATH").unwrap_or_default();
     let output = Command::new(wine_dir.join("bin/winepath"))
         .args(["-w"])
         .arg(path)
         .env("WINEPREFIX", prefix)
         .env("WINEDEBUG", "-all")
+        // Keep winepath on the prefix's Wine so it starts the private
+        // wineserver instead of the system one.
+        .env("PATH", format!("{}/bin:{search_path}", wine_dir.display()))
+        .env("WINE", wine_dir.join("bin/wine"))
+        .env("WINESERVER", wine_dir.join("bin/wineserver"))
+        .env("WINEDLLPATH", wine_dir.join("lib/wine"))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -141,6 +163,10 @@ fn launch_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
         (
             "WINESERVER".into(),
             wine_dir.join("bin/wineserver").display().to_string(),
+        ),
+        (
+            "WINEDLLPATH".into(),
+            wine_dir.join("lib/wine").display().to_string(),
         ),
         // FL Studio and its plugins are X11 clients; Wine uses XWayland on Wayland.
         (
@@ -229,11 +255,36 @@ mod tests {
         let mut lines = Vec::new();
         let outcome = launch(&opts, |_, line| lines.push(line.to_string())).unwrap();
         assert!(outcome.target.ends_with("FL64.exe"));
+        assert!(outcome.args[0].ends_with("FL64.exe"));
         let text = lines.join("\n");
-        assert!(text.contains("would run"));
+        assert!(text.contains(&format!("would run {}", wine.display())));
         assert!(text.contains("env WINEPREFIX="));
         assert!(text.contains("__GL_SYNC_TO_VBLANK=0"));
         assert!(text.contains("PULSE_LATENCY_MSEC=20"));
+    }
+
+    #[test]
+    fn winepath_stays_on_the_prefix_wine() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix");
+        fs::create_dir_all(&prefix).unwrap();
+        let wine_dir = dir.path().join(WINE_DIR_NAME);
+        fs::create_dir_all(wine_dir.join("bin")).unwrap();
+        let script = wine_dir.join("bin/winepath");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$PATH\" \"$WINESERVER\" \"$WINEPREFIX\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = windows_path(&prefix, &wine_dir, Path::new("/tmp/track.flp")).unwrap();
+        assert!(output.starts_with(&format!("{}/bin:", wine_dir.display())));
+        assert!(output.contains(&wine_dir.join("bin/wineserver").display().to_string()));
+        assert!(output.contains(&prefix.display().to_string()));
     }
 
     #[test]

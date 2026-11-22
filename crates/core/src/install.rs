@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+use crate::audio::AudioDriver;
 use crate::distro::OsRelease;
 use crate::journal::Report;
 use crate::manifest::{
-    Manifest, STEP_COMPONENTS, STEP_DEPS, STEP_DESKTOP, STEP_DXVK, STEP_FONTS, STEP_INSTALLER,
-    STEP_PREFIX, STEP_WEBVIEW2, STEP_WINE, StepStatus,
+    Manifest, STEP_AUDIO, STEP_COMPONENTS, STEP_DEPS, STEP_DESKTOP, STEP_DXVK, STEP_FONTS,
+    STEP_INSTALLER, STEP_PREFIX, STEP_WEBVIEW2, STEP_WINE, StepStatus,
 };
 use crate::packages::{Elevation, PlanRunOptions};
 use crate::runner::Stream;
-use crate::{app_exe, components, deps, desktop, dxvk, installer, packages, wine};
+use crate::{app_exe, audio, components, deps, desktop, dxvk, flstudio, installer, packages, wine};
 
 /// Steps run inside this module stream through its report, which already
 /// writes the log; giving them the path too doubled every line.
@@ -28,6 +29,8 @@ pub struct SetupOptions {
     pub installer: Option<PathBuf>,
     pub dxvk: bool,
     pub fonts: bool,
+    /// Low-latency ASIO driver to install.
+    pub audio: AudioDriver,
     pub dpi: Option<u32>,
     pub dry_run: bool,
     pub log_path: Option<PathBuf>,
@@ -42,6 +45,7 @@ pub struct SetupReport {
     pub fl_exe: Option<PathBuf>,
     pub fonts: bool,
     pub runtimes: bool,
+    pub audio_driver: Option<String>,
     pub dxvk_version: Option<String>,
     pub webview2: bool,
     pub desktop: bool,
@@ -130,6 +134,8 @@ where
         opts.dry_run,
     );
 
+    install_audio(opts, &mut report, &mut outcome);
+
     apply_dxvk(opts, &mut report, &mut outcome)?;
     // winetricks can leave its own Windows version behind.
     wine::reapply_windows(
@@ -187,6 +193,7 @@ where
     )?;
     outcome.wine_version = setup.wine_version;
 
+    install_audio(opts, &mut report, &mut outcome);
     let installed = installer::install(
         &installer::InstallerOptions {
             prefix: opts.prefix.clone(),
@@ -266,6 +273,7 @@ where
     if !runtimes {
         outcome.failures.push("plugin runtimes".to_string());
     }
+    install_audio(opts, &mut report, &mut outcome);
     wine::reapply_windows(
         &opts.prefix,
         opts.dpi,
@@ -285,7 +293,14 @@ fn finish_install(
     outcome: &mut SetupReport,
     apply_webview: bool,
 ) -> Result<()> {
-    // The runtime only exists after Image-Line's installer ran.
+    // The runtime usually comes from Image-Line's installer, but it is
+    // optional there and sometimes skipped. Install it when it is missing.
+    if !crate::components::webview2_installed(&opts.prefix) {
+        let _ =
+            components::install_webview2(&opts.prefix, opts.dry_run, CHILD_LOG, |stream, line| {
+                report.line(stream, line)
+            });
+    }
     outcome.webview2 = crate::components::webview2_installed(&opts.prefix);
     mark(
         &opts.prefix,
@@ -304,6 +319,18 @@ fn finish_install(
         wine::configure_webview2_prefix(&opts.prefix, opts.dry_run, CHILD_LOG, |stream, line| {
             report.line(stream, line)
         })?;
+    }
+    if let Err(error) = flstudio::configure(
+        &opts.prefix,
+        opts.audio,
+        opts.dry_run,
+        CHILD_LOG,
+        |stream, line| report.line(stream, line),
+    ) {
+        report.warn(format!("FL Studio settings failed: {error}"));
+        outcome
+            .failures
+            .push(format!("FL Studio settings: {error}"));
     }
 
     let desktop = desktop::create(
@@ -351,6 +378,37 @@ fn finish_install(
         ));
     }
     Ok(())
+}
+
+fn install_audio(opts: &SetupOptions, report: &mut Report<'_>, outcome: &mut SetupReport) {
+    match audio::install(
+        &opts.prefix,
+        opts.audio,
+        opts.dry_run,
+        CHILD_LOG,
+        |stream, line| report.line(stream, line),
+    ) {
+        Ok(result) => {
+            outcome.audio_driver = result.installed.then(|| result.driver.title().to_string());
+            let status = if result.installed {
+                StepStatus::Done
+            } else {
+                StepStatus::Skipped
+            };
+            mark(&opts.prefix, STEP_AUDIO, status, None, opts.dry_run);
+        }
+        Err(error) => {
+            report.warn(format!("low-latency audio failed: {error}"));
+            mark(
+                &opts.prefix,
+                STEP_AUDIO,
+                StepStatus::Failed,
+                Some(error.to_string()),
+                opts.dry_run,
+            );
+            outcome.failures.push(format!("audio: {error}"));
+        }
+    }
 }
 
 fn apply_dxvk(
@@ -544,8 +602,9 @@ mod tests {
         SetupOptions {
             prefix: prefix.to_path_buf(),
             installer: None,
-            dxvk: false,
+            dxvk: true,
             fonts: true,
+            audio: AudioDriver::WinePipe,
             dpi: None,
             dry_run: true,
             log_path: None,

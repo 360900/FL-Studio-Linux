@@ -5,16 +5,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioDriver;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub prefix: PathBuf,
-    /// Install DXVK into the prefix. Off by default: it replaces the Direct3D
-    /// stack that FL Studio and WebView2 render through.
+    /// Install DXVK into the prefix. On by default: FL Studio and its plugins
+    /// render through Direct3D, and DXVK maps it to Vulkan.
     pub dxvk: bool,
     /// Install Microsoft fonts and the musical-symbol font. FLEX crashes
     /// without the core fonts.
     pub fonts: bool,
+    /// Low-latency ASIO driver installed into the private Wine build.
+    pub audio: AudioDriver,
     /// Override distro detection, mainly for dry-run testing.
     pub distro_override: Option<String>,
 }
@@ -23,8 +27,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             prefix: default_prefix(),
-            dxvk: false,
+            dxvk: true,
             fonts: true,
+            audio: AudioDriver::WinePipe,
             distro_override: None,
         }
     }
@@ -90,7 +95,18 @@ pub fn validate_prefix(path: &Path) -> Result<()> {
 /// A directory this tool (or Wine) created. The uninstaller uses this to
 /// refuse deleting a folder it does not recognise.
 pub fn looks_like_prefix(path: &Path) -> bool {
-    path.join("system.reg").is_file() || path.join("drive_c").is_dir()
+    path.join("system.reg").is_file()
+        || path.join("drive_c").is_dir()
+        || path.join(crate::WINE_DIR_NAME).exists()
+        || fs::read_dir(path)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("wine-") && entry.path().is_dir()
+                })
+            })
+            .unwrap_or(false)
 }
 
 pub fn config_dir() -> PathBuf {
@@ -159,6 +175,7 @@ mod tests {
             prefix: PathBuf::from("/tmp/prefix"),
             dxvk: true,
             fonts: false,
+            audio: AudioDriver::None,
             distro_override: Some("ubuntu".into()),
         };
         cfg.save_to(&path).unwrap();
@@ -166,7 +183,14 @@ mod tests {
         assert_eq!(loaded.prefix, PathBuf::from("/tmp/prefix"));
         assert!(loaded.dxvk);
         assert!(!loaded.fonts);
+        assert_eq!(loaded.audio, AudioDriver::None);
         assert_eq!(loaded.distro_override.as_deref(), Some("ubuntu"));
+    }
+
+    #[test]
+    fn old_wineasio_config_falls_back_to_winepipe() {
+        let cfg: Config = toml::from_str("audio = \"wineasio\"").unwrap();
+        assert_eq!(cfg.audio, AudioDriver::WinePipe);
     }
 
     #[test]
@@ -174,7 +198,8 @@ mod tests {
         let cfg = Config::load_from(Path::new("/nonexistent/fl/config.toml")).unwrap();
         assert!(cfg.prefix.ends_with(crate::PREFIX_DIR_NAME));
         assert!(cfg.fonts);
-        assert!(!cfg.dxvk);
+        assert!(cfg.dxvk);
+        assert_eq!(cfg.audio, AudioDriver::WinePipe);
     }
 
     #[test]

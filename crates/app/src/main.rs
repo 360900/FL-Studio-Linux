@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
+use fl_studio_linux_core::audio::AudioDriver;
 use fl_studio_linux_core::config::{Config, default_prefix};
 use fl_studio_linux_core::deps;
 use fl_studio_linux_core::doctor::{self, DoctorReport};
@@ -43,6 +44,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_prefix_text(display_path(&cfg.prefix).into());
     ui.set_dxvk_enabled(cfg.dxvk);
     ui.set_fonts_enabled(cfg.fonts);
+    ui.set_audio_index(cfg.audio.index());
     if let Some(family) = monospace_family() {
         ui.set_mono_font(family.into());
     }
@@ -132,6 +134,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut saved = Config::load().unwrap_or_else(|_| cfg.clone());
             saved.dxvk = ui.get_dxvk_enabled();
             saved.fonts = ui.get_fonts_enabled();
+            saved.audio = AudioDriver::from_index(ui.get_audio_index());
             let _ = saved.save();
         });
     }
@@ -215,12 +218,14 @@ fn main() -> Result<(), slint::PlatformError> {
 struct SelectedOptions {
     dxvk: bool,
     fonts: bool,
+    audio: AudioDriver,
 }
 
 fn selected_options(ui: &MainWindow) -> SelectedOptions {
     SelectedOptions {
         dxvk: ui.get_dxvk_enabled(),
         fonts: ui.get_fonts_enabled(),
+        audio: AudioDriver::from_index(ui.get_audio_index()),
     }
 }
 
@@ -400,6 +405,7 @@ fn spawn_install(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx
                     installer: None,
                     dxvk: options.dxvk,
                     fonts: options.fonts,
+                    audio: options.audio,
                     dpi: Some(dpi),
                     dry_run: false,
                     log_path: Some(log_path.clone()),
@@ -415,6 +421,7 @@ fn spawn_install(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx
             let mut saved = cfg.clone();
             saved.dxvk = options.dxvk;
             saved.fonts = options.fonts;
+            saved.audio = options.audio;
             saved.save()?;
             Ok(())
         })();
@@ -458,6 +465,7 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
                     installer: None,
                     dxvk: cfg.dxvk,
                     fonts: cfg.fonts,
+                    audio: cfg.audio,
                     dpi: Some(dpi),
                     dry_run: false,
                     log_path: Some(log_path.clone()),
@@ -500,6 +508,7 @@ fn spawn_repair(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx:
                     installer: None,
                     dxvk: options.dxvk,
                     fonts: options.fonts,
+                    audio: options.audio,
                     dpi: Some(dpi),
                     dry_run: false,
                     log_path: Some(log_path.clone()),
@@ -511,6 +520,7 @@ fn spawn_repair(cfg: Config, options: SelectedOptions, display: DisplayInfo, tx:
             let mut saved = cfg.clone();
             saved.dxvk = options.dxvk;
             saved.fonts = options.fonts;
+            saved.audio = options.audio;
             saved.save()?;
             Ok(())
         })();
@@ -671,12 +681,17 @@ fn apply_report(
     } else {
         "Not installed".to_string()
     };
+    let audio = report
+        .audio_driver
+        .clone()
+        .unwrap_or_else(|| "Off".to_string());
 
     ui.set_distro_text(distro.into());
     ui.set_gpu_text(gpu.into());
     ui.set_deps_text(deps.into());
     ui.set_deps_ok(missing.is_empty() && has_download);
     ui.set_wine_text(wine.clone().into());
+    ui.set_audio_text(audio.clone().into());
     ui.set_webview_text(webview.clone().into());
     ui.set_prefix_text(display_path(&report.prefix).into());
     ui.set_installed(report.installed);

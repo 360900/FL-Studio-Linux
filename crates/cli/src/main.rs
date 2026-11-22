@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use fl_studio_linux_core::audio::AudioDriver;
 use fl_studio_linux_core::config::{Config, default_prefix, expand_home};
 use fl_studio_linux_core::deps;
 use fl_studio_linux_core::distro::OsRelease;
@@ -92,6 +93,9 @@ enum Command {
         /// Install Microsoft fonts and the musical-symbol font
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         fonts: Option<bool>,
+        /// Low-latency audio driver: winepipe or none
+        #[arg(long, value_parser = ["winepipe", "none"])]
+        audio: Option<String>,
         /// Wine DPI to set, 96 = 100% (default: detected from the display)
         #[arg(long, value_parser = clap::value_parser!(u32).range(96..=480))]
         dpi: Option<u32>,
@@ -131,6 +135,9 @@ enum Command {
         /// Install Microsoft fonts and the musical-symbol font if missing
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         fonts: Option<bool>,
+        /// Low-latency audio driver: winepipe or none
+        #[arg(long, value_parser = ["winepipe", "none"])]
+        audio: Option<String>,
         /// Wine DPI to set, 96 = 100% (default: detected from the display)
         #[arg(long, value_parser = clap::value_parser!(u32).range(96..=480))]
         dpi: Option<u32>,
@@ -191,9 +198,10 @@ fn main() -> Result<()> {
             skip_deps,
             dxvk,
             fonts,
+            audio,
             dpi,
         } => run_install(
-            &cfg, dry_run, yes, prefix, installer, skip_deps, dxvk, fonts, dpi,
+            &cfg, dry_run, yes, prefix, installer, skip_deps, dxvk, fonts, audio, dpi,
         ),
         Command::Update {
             dry_run,
@@ -208,8 +216,9 @@ fn main() -> Result<()> {
             prefix,
             dxvk,
             fonts,
+            audio,
             dpi,
-        } => run_repair(&cfg, dry_run, yes, prefix, dxvk, fonts, dpi),
+        } => run_repair(&cfg, dry_run, yes, prefix, dxvk, fonts, audio, dpi),
         Command::Launch {
             dry_run,
             prefix,
@@ -247,6 +256,10 @@ fn print_report(report: &DoctorReport) {
     println!(
         "  wine build    {}",
         report.wine_build.as_deref().unwrap_or("not installed")
+    );
+    println!(
+        "  audio         {}",
+        report.audio_driver.as_deref().unwrap_or("off")
     );
     println!(
         "  prefix        {} (exists={}, installed={})",
@@ -400,8 +413,18 @@ fn yes_no(value: bool) -> &'static str {
     if value { "ok" } else { "skipped" }
 }
 
-fn resolve_options(cfg: &Config, dxvk: Option<bool>, fonts: Option<bool>) -> (bool, bool) {
-    (dxvk.unwrap_or(cfg.dxvk), fonts.unwrap_or(cfg.fonts))
+fn resolve_options(
+    cfg: &Config,
+    dxvk: Option<bool>,
+    fonts: Option<bool>,
+    audio: Option<String>,
+) -> (bool, bool, AudioDriver) {
+    let audio = match audio.as_deref() {
+        Some("none") => AudioDriver::None,
+        Some("winepipe") => AudioDriver::WinePipe,
+        _ => cfg.audio,
+    };
+    (dxvk.unwrap_or(cfg.dxvk), fonts.unwrap_or(cfg.fonts), audio)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -414,12 +437,13 @@ fn run_install(
     skip_deps: bool,
     dxvk: Option<bool>,
     fonts: Option<bool>,
+    audio: Option<String>,
     dpi: Option<u32>,
 ) -> Result<()> {
     let os = OsRelease::detect()?;
     let prefix = resolve_prefix(prefix, cfg);
     let installer = installer.map(|path| expand_home(&path));
-    let (dxvk, fonts) = resolve_options(cfg, dxvk, fonts);
+    let (dxvk, fonts, audio) = resolve_options(cfg, dxvk, fonts, audio);
 
     println!("install FL Studio");
     println!("  distro    {} ({})", os.name(), os.family().label());
@@ -446,6 +470,7 @@ fn run_install(
     );
     println!("  fonts     {}", if fonts { "on" } else { "off" });
     println!("  dxvk      {}", if dxvk { "on" } else { "off" });
+    println!("  audio     {}", audio.title());
     let dpi = resolve_dpi(dpi);
     println!();
 
@@ -454,6 +479,7 @@ fn run_install(
         installer,
         dxvk,
         fonts,
+        audio,
         dpi,
         dry_run,
         log_path: None,
@@ -494,6 +520,7 @@ fn run_install(
     saved.prefix = prefix;
     saved.dxvk = dxvk;
     saved.fonts = fonts;
+    saved.audio = audio;
     saved.save()?;
     println!("saved install location and options in the config");
     Ok(())
@@ -512,6 +539,10 @@ fn print_outcome(outcome: &install::SetupReport) {
     println!(
         "  dxvk          {}",
         outcome.dxvk_version.as_deref().unwrap_or("skipped")
+    );
+    println!(
+        "  audio         {}",
+        outcome.audio_driver.as_deref().unwrap_or("off")
     );
     println!("  webview2      {}", yes_no(outcome.webview2));
     println!("  desktop entry {}", yes_no(outcome.desktop));
@@ -560,6 +591,7 @@ fn run_update(
         installer,
         dxvk: cfg.dxvk,
         fonts: cfg.fonts,
+        audio: cfg.audio,
         dpi,
         dry_run,
         log_path,
@@ -577,6 +609,7 @@ fn run_update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_repair(
     cfg: &Config,
     dry_run: bool,
@@ -584,10 +617,11 @@ fn run_repair(
     prefix: Option<PathBuf>,
     dxvk: Option<bool>,
     fonts: Option<bool>,
+    audio: Option<String>,
     dpi: Option<u32>,
 ) -> Result<()> {
     let prefix = resolve_prefix(prefix, cfg);
-    let (dxvk, fonts) = resolve_options(cfg, dxvk, fonts);
+    let (dxvk, fonts, audio) = resolve_options(cfg, dxvk, fonts, audio);
     println!("repair FL Studio");
     println!("  prefix    {}", prefix.display());
     let dpi = resolve_dpi(dpi);
@@ -612,6 +646,7 @@ fn run_repair(
         installer: None,
         dxvk,
         fonts,
+        audio,
         dpi,
         dry_run,
         log_path,
@@ -625,6 +660,7 @@ fn run_repair(
     saved.prefix = prefix;
     saved.dxvk = dxvk;
     saved.fonts = fonts;
+    saved.audio = audio;
     if !dry_run {
         saved.save()?;
     }

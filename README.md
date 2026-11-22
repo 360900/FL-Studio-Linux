@@ -17,10 +17,12 @@ your Image-Line account.
   26.1.4 and later need Wine 11.21 or newer for the signature check.
 - System dependencies for Arch, Ubuntu-family, Fedora and openSUSE
 - Microsoft core fonts (Arial, Verdana and the rest) plus MS Gothic for
-  musical symbols, so FLEX and the piano roll render correctly
+  musical symbols, so FLEX, FL Cloud and the Sounds tab render correctly
 - Visual C++, GDI+ and shader compiler runtimes for Windows plugins
-- Optional DXVK, off by default because it can affect WebView2 panes
-- WebView2 registry fixes, disabled Edge updater
+- DXVK on by default, with Vulkan rendering and WebView2 GPU acceleration
+- Bundled WinePipe ASIO driver, installed and selected automatically
+- PipeWire's failing virtual MIDI inputs disabled in FL Studio
+- WebView2 runtime fallback, registry fixes, disabled Edge updater
 - Automatic Wine DPI from the display's resolution and scale
 - FLP association and `flstudio://` sign-in handler
 - Update, repair and uninstall, live log and visible errors
@@ -93,10 +95,10 @@ cargo run --release -p fl-studio-linux-gui   # from a source checkout
 CLI:
 
 ```sh
-fl-studio-linux install     # --installer <setup.exe>, --dxvk true|false, --fonts true|false, --dpi <n>
+fl-studio-linux install     # --installer <setup.exe>, --dxvk true|false, --fonts true|false, --audio winepipe|none, --dpi <n>
 fl-studio-linux launch      # project.flp or flstudio://... args are forwarded
 fl-studio-linux update
-fl-studio-linux repair      # missing fonts, prefix settings, DXVK, launcher
+fl-studio-linux repair      # missing fonts, prefix settings, DXVK, audio driver, launcher
 fl-studio-linux uninstall
 ```
 
@@ -111,10 +113,26 @@ inside FL Studio to unlock a paid edition.
 
 - FL Studio 26.1.4 and later need Wine 11.21 or newer. Do not switch the
   prefix to an older runner.
-- DXVK is off by default. It helps slow Direct3D plugins but can darken or
-  break FL Cloud, Help and the Sounds tab. Toggle it in Options and repair.
-- If FL Studio lists PipeWire MIDI ports as `FAIL`, open `Options > MIDI
-  Settings` and disable those inputs. They are virtual ports, not hardware.
+- FL Studio always starts through the prefix's private Wine build. Launching
+  the EXE directly would let the system Wine handle it and break WebView2 and
+  DXVK isolation.
+- DXVK is on by default and maps Direct3D to Vulkan. If a plugin or the
+  WebView2 panes misbehave, turn Hardware acceleration off in Options and run
+  Repair.
+- WinePipe is the low-latency driver and talks to PipeWire directly. It is
+  installed into the private Wine build and selected in FL Studio
+  automatically. Change it in Options or in `Options > Audio settings` in FL
+  Studio.
+- FL Studio disables PipeWire's internal `PipeWire-System`,
+  `PipeWire-RT-Event` and `Midi Through` inputs during install. If no hardware
+  MIDI controller is connected, MIDI input is also turned off so FL does not
+  raise the PipeWire driver error at startup. Connect a controller and run
+  Repair to enable MIDI input again. With hardware present, the virtual ports
+  stay disabled but their `FAIL` labels can remain in the MIDI list.
+- FL Cloud, the Help pane and the Sounds tab are WebView2 pages. They need the
+  Microsoft fonts and plugin runtimes installed by this app. If Image-Line's
+  installer skips WebView2, the app downloads and installs Microsoft's
+  Evergreen runtime itself; a bare FL Studio install in Wine leaves them black.
 - The installer starts Edge WebView2 near the end and can look stuck while its
   services keep running. The watchdog stops the prefix after FL64.exe has been
   stable for a while.
@@ -143,6 +161,7 @@ inside FL Studio to unlock a paid edition.
 | `crates/app` | Slint GUI |
 | `ui/main.slint` | Window layout |
 | `packaging` | Desktop entry, icon, PKGBUILD, AppImage |
+| `vendor` | Bundled WinePipe binaries and license |
 
 ## Credits
 
@@ -152,9 +171,12 @@ inside FL Studio to unlock a paid edition.
   for the WebView2 Windows 8 workaround and plugin runtimes
 - [FL Studio on Linux in 2026](https://blog.mrquantumoff.dev/fl-studio-on-linux-in-2026-is-very-much-usable-with-vsts-too-with-wine/)
   for the font, runtime and NVIDIA vsync notes
+- [mrquantumoff/winepipe](https://github.com/mrquantumoff/winepipe) for the
+  direct PipeWire ASIO driver
 - [Kron4ek/Wine-Builds](https://github.com/Kron4ek/Wine-Builds) for the Wine builds
 - WineHQ bug 60273 and the Wine 11.21 release for the FL Studio signature fix
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). The bundled audio driver keeps its
+own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

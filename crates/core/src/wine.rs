@@ -53,9 +53,11 @@ where
         && !crate::config::looks_like_prefix(prefix)
         && fs::read_dir(prefix)
             .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.file_name() != std::ffi::OsStr::new("logs"))
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    name != std::ffi::OsStr::new("logs")
+                        && name != std::ffi::OsStr::new(crate::manifest::MANIFEST_FILE)
+                })
             })
             .unwrap_or(false)
     {
@@ -213,13 +215,32 @@ fn configure_webview2(
     dry_run: bool,
     report: &mut Report<'_>,
 ) -> Result<()> {
-    report.info("configuring WebView2 and its updater");
+    report.info("configuring WebView2, graphics and its updater");
+    let gpu_flags = "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy";
     let entries = [
         (
             "HKCU\\Software\\Wine\\AppDefaults\\msedgewebview2.exe",
             "Version",
             "REG_SZ",
             "win8",
+        ),
+        (
+            "HKCU\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+            "FL64.exe",
+            "REG_SZ",
+            gpu_flags,
+        ),
+        (
+            "HKCU\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+            "FL.exe",
+            "REG_SZ",
+            gpu_flags,
+        ),
+        (
+            "HKCU\\Software\\Wine\\Direct3D",
+            "renderer",
+            "REG_SZ",
+            "vulkan",
         ),
         (
             "HKLM\\System\\CurrentControlSet\\Services\\edgeupdate",
@@ -674,6 +695,10 @@ fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
         ("WINESERVER_TIMEOUT".into(), "60".into()),
         ("WINETRICKS_GUI".into(), "none".into()),
         (
+            "WINEDLLPATH".into(),
+            wine_dir.join("lib/wine").display().to_string(),
+        ),
+        (
             "PATH".into(),
             format!("{}:{path}", wine_dir.join("bin").display()),
         ),
@@ -858,6 +883,8 @@ mod tests {
         assert!(text.contains("winecfg"));
         assert!(text.contains("msedgewebview2.exe"));
         assert!(text.contains("edgeupdate"));
+        assert!(text.contains("ignore-gpu-blocklist"));
+        assert!(text.contains("renderer") && text.contains("vulkan"));
     }
 
     #[test]

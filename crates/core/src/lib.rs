@@ -1,5 +1,6 @@
 //! Headless engine for the FL Studio Linux installer.
 
+pub mod audio;
 pub mod components;
 pub mod config;
 pub mod deps;
@@ -7,6 +8,7 @@ pub mod desktop;
 pub mod distro;
 pub mod doctor;
 pub mod dxvk;
+pub mod flstudio;
 pub mod gpu;
 pub mod http;
 pub mod install;

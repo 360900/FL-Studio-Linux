@@ -109,8 +109,10 @@ where
         fs::copy(&source, system32.join(dll))
             .with_context(|| format!("copying {}", source.display()))?;
         if syswow64.is_dir() {
-            let source = root.join("x86").join(dll);
-            if source.is_file() {
+            let source = [root.join("x86").join(dll), root.join("x32").join(dll)]
+                .into_iter()
+                .find(|path| path.is_file());
+            if let Some(source) = source {
                 fs::copy(&source, syswow64.join(dll))
                     .with_context(|| format!("copying {}", source.display()))?;
             }
@@ -235,6 +237,10 @@ fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
         ("WINEPREFIX".into(), prefix.display().to_string()),
         ("WINEDEBUG".into(), "-all,fixme-all".into()),
         ("WINESERVER_TIMEOUT".into(), "60".into()),
+        (
+            "WINEDLLPATH".into(),
+            wine_dir.join("lib/wine").display().to_string(),
+        ),
         (
             "PATH".into(),
             format!("{}:{path}", wine_dir.join("bin").display()),

@@ -16,6 +16,7 @@ pub const STEP_WINE: &str = "wine";
 pub const STEP_COMPONENTS: &str = "components";
 pub const STEP_FONTS: &str = "fonts";
 pub const STEP_DXVK: &str = "dxvk";
+pub const STEP_AUDIO: &str = "audio";
 pub const STEP_INSTALLER: &str = "installer";
 pub const STEP_WEBVIEW2: &str = "webview2";
 pub const STEP_DESKTOP: &str = "desktop-entry";
@@ -27,6 +28,7 @@ pub const ALL_STEPS: &[&str] = &[
     STEP_COMPONENTS,
     STEP_FONTS,
     STEP_DXVK,
+    STEP_AUDIO,
     STEP_INSTALLER,
     STEP_WEBVIEW2,
     STEP_DESKTOP,

@@ -1,4 +1,4 @@
-import { Palette, ProgressIndicator, ScrollView, Switch } from "std-widgets.slint";
+import { ComboBox, Palette, ProgressIndicator, ScrollView, Switch } from "std-widgets.slint";
 
 export struct LogLine {
     text: string,
@@ -300,6 +300,7 @@ export component MainWindow inherits Window {
     in-out property <string> distro-text: "Checking…";
     in-out property <string> gpu-text: "Checking…";
     in-out property <string> wine-text: "Checking…";
+    in-out property <string> audio-text: "Checking…";
     in-out property <string> deps-text: "Checking…";
     in-out property <string> webview-text: "Checking…";
     in-out property <string> prefix-text;
@@ -311,6 +312,7 @@ export component MainWindow inherits Window {
     in property <bool> deps-ok: true;
     in-out property <bool> dxvk-enabled;
     in-out property <bool> fonts-enabled;
+    in-out property <int> audio-index: 0;
     in-out property <bool> details-open;
     in-out property <bool> confirm-open;
     // Height that fits the content exactly; used to shrink the window when the log closes.
@@ -573,6 +575,23 @@ export component MainWindow inherits Window {
                         spacing: 24px;
 
                         RowLabel {
+                            text: "Audio";
+                            width: 132px;
+                        }
+
+                        RowValue {
+                            text: root.audio-text;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        spacing: 24px;
+
+                        RowLabel {
                             text: "Dependencies";
                             width: 132px;
                         }
@@ -627,7 +646,7 @@ export component MainWindow inherits Window {
                 VerticalLayout {
                     OptionRow {
                         title: "Microsoft fonts";
-                        description: "Arial, Verdana and musical symbols. FLEX needs them.";
+                        description: "Required by FLEX and the WebView2 panes.";
 
                         Switch {
                             horizontal-stretch: 0;
@@ -642,14 +661,31 @@ export component MainWindow inherits Window {
                     Divider { }
 
                     OptionRow {
-                        title: "DXVK";
-                        description: "Faster Direct3D plugins. Can affect WebView2 panes.";
+                        title: "Hardware acceleration";
+                        description: "DXVK renders Direct3D through Vulkan.";
 
                         Switch {
                             horizontal-stretch: 0;
                             checked <=> root.dxvk-enabled;
                             enabled: !root.busy;
                             toggled => {
+                                root.options-changed();
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    OptionRow {
+                        title: "Low-latency audio";
+                        description: "WinePipe talks to PipeWire directly for low latency.";
+
+                        ComboBox {
+                            width: 220px;
+                            model: ["WinePipe (recommended)", "Off"];
+                            current-index <=> root.audio-index;
+                            enabled: !root.busy;
+                            selected => {
                                 root.options-changed();
                             }
                         }
