@@ -110,8 +110,10 @@ diagnostics: `doctor`, `deps`, `wine-setup`.
 - FL Studio always starts through the prefix's private Wine build. Launching
   the EXE directly would let the system Wine handle it and break WebView2 and
   DXVK isolation.
-- DXVK is on by default and maps Direct3D to Vulkan. If a plugin or the
-  WebView2 panes misbehave, run `fl-studio-linux repair --dxvk false`.
+- DXVK is on by default and maps Direct3D to Vulkan. It installs DXVK 3.1.1
+  on Vulkan 1.4 drivers, 2.7.1 on Vulkan 1.3 drivers, and is skipped on older
+  ones. If a plugin or the WebView2 panes misbehave, run
+  `fl-studio-linux repair --dxvk false`.
 - WinePipe is the low-latency driver and talks to PipeWire directly. It is
   installed and selected in FL Studio automatically. Change it with `--audio`
   or in `Options > Audio settings` in FL Studio.

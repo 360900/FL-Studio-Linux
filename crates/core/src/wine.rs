@@ -238,12 +238,6 @@ fn configure_webview2(
             gpu_flags,
         ),
         (
-            "HKCU\\Software\\Wine\\Direct3D",
-            "renderer",
-            "REG_SZ",
-            "vulkan",
-        ),
-        (
             "HKLM\\System\\CurrentControlSet\\Services\\edgeupdate",
             "Start",
             "REG_DWORD",
@@ -265,6 +259,46 @@ fn configure_webview2(
     for (key, name, kind, value) in entries {
         reg_add(prefix, wine_dir, key, name, kind, value, dry_run, report)?;
     }
+    set_d3d_renderer(
+        prefix,
+        wine_dir,
+        deps::vulkan_api_version().is_some(),
+        dry_run,
+        report,
+    )
+}
+
+/// WineD3D's Vulkan renderer has no OpenGL fallback, so it is only selected
+/// when a Vulkan driver exists; otherwise Wine's OpenGL default stays.
+fn set_d3d_renderer(
+    prefix: &Path,
+    wine_dir: &Path,
+    vulkan: bool,
+    dry_run: bool,
+    report: &mut Report<'_>,
+) -> Result<()> {
+    const KEY: &str = "HKCU\\Software\\Wine\\Direct3D";
+    if vulkan {
+        return reg_add(
+            prefix, wine_dir, KEY, "renderer", "REG_SZ", "vulkan", dry_run, report,
+        );
+    }
+    report.info("no Vulkan driver found; Direct3D stays on OpenGL");
+    let mut cmd = Command::new(wine_dir.join("bin/wine"));
+    cmd.args(["reg", "delete", KEY, "/v", "renderer", "/f"]);
+    if dry_run {
+        report.info(format!(
+            "    WINEPREFIX={} {}",
+            prefix.display(),
+            describe(&cmd)
+        ));
+        return Ok(());
+    }
+    let mut run_opts = stream_opts(Some(Duration::from_secs(120)));
+    run_opts.envs = wine_env(prefix, wine_dir, "-all");
+    run_opts.echo = false;
+    // Fails harmlessly when the value was never set.
+    let _ = run_logged(report, cmd, run_opts);
     Ok(())
 }
 
@@ -922,7 +956,23 @@ mod tests {
         assert!(text.contains("msedgewebview2.exe"));
         assert!(text.contains("edgeupdate"));
         assert!(text.contains("ignore-gpu-blocklist"));
-        assert!(text.contains("renderer") && text.contains("vulkan"));
+        assert!(text.contains("renderer"));
+    }
+
+    #[test]
+    fn renderer_follows_vulkan_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path();
+        let wine_dir = prefix.join(WINE_DIR_NAME);
+        let mut lines = Vec::new();
+        let mut sink = |_, line: &str| lines.push(line.to_string());
+        let mut report = Report::new(None, &mut sink);
+        set_d3d_renderer(prefix, &wine_dir, true, true, &mut report).unwrap();
+        set_d3d_renderer(prefix, &wine_dir, false, true, &mut report).unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("reg add 'HKCU\\Software\\Wine\\Direct3D' /v renderer"));
+        assert!(text.contains("/d vulkan"));
+        assert!(text.contains("reg delete 'HKCU\\Software\\Wine\\Direct3D' /v renderer"));
     }
 
     #[test]

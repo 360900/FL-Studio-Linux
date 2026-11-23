@@ -177,42 +177,6 @@ pub(crate) fn download_verified(
     Ok(path)
 }
 
-/// Fetch a small text document (JSON API, key file) into memory.
-pub(crate) fn fetch_text(url: &str) -> Result<String> {
-    let output = if which("curl").is_some() {
-        Command::new("curl")
-            .args([
-                "-fsSL",
-                "--retry",
-                "3",
-                "--retry-delay",
-                "2",
-                "--connect-timeout",
-                "20",
-                "-A",
-                USER_AGENT,
-                url,
-            ])
-            .output()
-            .with_context(|| format!("running curl for {url}"))?
-    } else if which("wget").is_some() {
-        Command::new("wget")
-            .args(["-qO-", "--tries=3", "--timeout=20", "-U", USER_AGENT, url])
-            .output()
-            .with_context(|| format!("running wget for {url}"))?
-    } else {
-        bail!("curl or wget is required to download {url}");
-    };
-
-    if !output.status.success() {
-        bail!(
-            "failed to fetch {url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8(output.stdout).with_context(|| format!("decoding {url}"))
-}
-
 /// Download `url` into `destination`, removing a partial file on failure.
 pub(crate) fn download(
     report: &mut Report<'_>,

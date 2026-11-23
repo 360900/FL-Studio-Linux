@@ -1,7 +1,9 @@
 //! DXVK installation and removal.
 //!
 //! DXVK is enabled by default to map Direct3D calls from FL Studio and plugins
-//! to Vulkan. It can be removed with `repair --dxvk false`.
+//! to Vulkan. It can be removed with `repair --dxvk false`. Releases are
+//! pinned with their checksums: DXVK 3 needs a Vulkan 1.4 driver, so older
+//! drivers get the last 2.x release instead.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,13 +14,44 @@ use anyhow::{Context, Result, bail};
 
 use crate::WINE_DIR_NAME;
 use crate::config;
+use crate::deps;
 use crate::http;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
 use crate::wine;
 
 pub const DXVK_REPO: &str = "doitsujin/dxvk";
-pub const DXVK_FALLBACK_VERSION: &str = "3.1.1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Release {
+    pub version: &'static str,
+    sha256: &'static str,
+    /// Lowest Vulkan version the release runs on.
+    pub min_vulkan: (u32, u32),
+}
+
+/// Newest first.
+pub const RELEASES: [Release; 2] = [
+    Release {
+        version: "3.1.1",
+        sha256: "40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608",
+        min_vulkan: (1, 4),
+    },
+    Release {
+        version: "2.7.1",
+        sha256: "d85ce7c79f57ecd765aaa1b9e7007cb875e6fde9f6d331df799bce73d513ce87",
+        min_vulkan: (1, 3),
+    },
+];
+
+/// The newest release the driver supports, or `None` without a usable driver.
+pub fn release_for(vulkan: Option<(u32, u32)>) -> Option<Release> {
+    let vulkan = vulkan?;
+    RELEASES
+        .into_iter()
+        .find(|release| vulkan >= release.min_vulkan)
+}
+
 const DXVK_DLLS: [&str; 5] = [
     "d3d8.dll",
     "d3d9.dll",
@@ -27,8 +60,29 @@ const DXVK_DLLS: [&str; 5] = [
     "dxgi.dll",
 ];
 
+/// Install the DXVK release the host's Vulkan driver supports. Fails, after
+/// removing an earlier DXVK, when no driver is recent enough.
 pub fn install<F>(
     prefix: &Path,
+    dry_run: bool,
+    log_path: Option<PathBuf>,
+    on_line: F,
+) -> Result<Option<String>>
+where
+    F: FnMut(Stream, &str),
+{
+    install_for(
+        prefix,
+        deps::vulkan_api_version(),
+        dry_run,
+        log_path,
+        on_line,
+    )
+}
+
+fn install_for<F>(
+    prefix: &Path,
+    vulkan: Option<(u32, u32)>,
     dry_run: bool,
     log_path: Option<PathBuf>,
     on_line: F,
@@ -42,10 +96,18 @@ where
     let wine = wine_dir.join("bin/wine");
 
     report.info("DXVK for Direct3D plugins");
+    let release = release_for(vulkan);
     if dry_run {
         let dlls = DXVK_DLLS.join(" ");
+        let Some(release) = release else {
+            report.info(format!("    skip DXVK: {}", unsupported_reason(vulkan)));
+            return Ok(None);
+        };
+        let version = release.version;
+        report.info(format!("    {}", release_url(version)));
         report.info(format!(
-            "    curl -fL https://github.com/{DXVK_REPO}/releases/download/v<latest>/dxvk-<latest>.tar.gz -o <cache>"
+            "    echo '{}  dxvk-{version}.tar.gz' | sha256sum -c -",
+            release.sha256
         ));
         report.info(format!(
             "    cp <dxvk>/x64/{dlls} {}",
@@ -72,34 +134,33 @@ where
         );
     }
 
-    let version = latest_version().unwrap_or_else(|| DXVK_FALLBACK_VERSION.to_string());
-    let archive = http::download_cached(
+    let Some(release) = release else {
+        // A DXVK left from an earlier install would break Direct3D entirely.
+        remove_installed(prefix, &wine_dir, &mut report);
+        bail!(
+            "{}; plugins use WineD3D instead",
+            unsupported_reason(vulkan)
+        );
+    };
+    let version = release.version;
+    report.info(format!(
+        "Vulkan {}.{} driver found; using DXVK {version}",
+        vulkan.map_or(0, |v| v.0),
+        vulkan.map_or(0, |v| v.1)
+    ));
+    let archive = http::download_verified(
         &mut report,
-        &format!(
-            "https://github.com/{DXVK_REPO}/releases/download/v{version}/dxvk-{version}.tar.gz"
-        ),
+        &release_url(version),
         &format!("dxvk-{version}.tar.gz"),
+        release.sha256,
         Duration::from_secs(600),
     )?;
 
     let cache = prefix.join(".cache");
     let root = cache.join(format!("dxvk-{version}"));
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
-    if !root.join("x64/d3d9.dll").is_file() {
-        let mut cmd = Command::new("tar");
-        cmd.arg("-xzf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&cache)
-            .arg("--no-same-owner");
-        let result = runner::run(
-            cmd,
-            RunOptions::default().stall(Duration::from_secs(300)),
-            |stream, line| report.line(stream, line),
-        )?;
-        if !result.success() {
-            bail!("extracting DXVK failed: {}", result.tail_text(10));
-        }
+    if !extracted(&root) {
+        extract(&archive, &cache, &root, &mut report)?;
     }
 
     wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
@@ -108,19 +169,13 @@ where
     fs::create_dir_all(&system32)?;
     for dll in DXVK_DLLS {
         let source = root.join("x64").join(dll);
-        if !source.is_file() {
-            bail!("the DXVK archive is missing x64/{dll}");
-        }
         fs::copy(&source, system32.join(dll))
             .with_context(|| format!("copying {}", source.display()))?;
-        if syswow64.is_dir() {
-            let source = [root.join("x86").join(dll), root.join("x32").join(dll)]
-                .into_iter()
-                .find(|path| path.is_file());
-            if let Some(source) = source {
-                fs::copy(&source, syswow64.join(dll))
-                    .with_context(|| format!("copying {}", source.display()))?;
-            }
+        if syswow64.is_dir()
+            && let Some(source) = dll_32(&root, dll)
+        {
+            fs::copy(&source, syswow64.join(dll))
+                .with_context(|| format!("copying {}", source.display()))?;
         }
     }
 
@@ -133,9 +188,73 @@ where
             &mut report,
         );
     }
-    config::write_prefix_state(prefix, ".dxvk_version", &version)?;
+    config::write_prefix_state(prefix, ".dxvk_version", version)?;
     report.info(format!("installed DXVK {version}"));
-    Ok(Some(version))
+    Ok(Some(version.to_string()))
+}
+
+fn release_url(version: &str) -> String {
+    format!("https://github.com/{DXVK_REPO}/releases/download/v{version}/dxvk-{version}.tar.gz")
+}
+
+fn unsupported_reason(vulkan: Option<(u32, u32)>) -> String {
+    let (major, minor) = RELEASES[RELEASES.len() - 1].min_vulkan;
+    match vulkan {
+        Some((found_major, found_minor)) => format!(
+            "the Vulkan driver supports {found_major}.{found_minor}, but DXVK needs {major}.{minor} or newer"
+        ),
+        None => format!("no Vulkan driver found; DXVK needs Vulkan {major}.{minor} or newer"),
+    }
+}
+
+fn dll_32(root: &Path, dll: &str) -> Option<PathBuf> {
+    [root.join("x32").join(dll), root.join("x86").join(dll)]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// Every DLL is present, so an interrupted extraction is not mistaken for a
+/// finished one.
+fn extracted(root: &Path) -> bool {
+    DXVK_DLLS
+        .iter()
+        .all(|dll| root.join("x64").join(dll).is_file() && dll_32(root, dll).is_some())
+}
+
+/// Extract into a staging folder and move it into place only when complete.
+fn extract(archive: &Path, cache: &Path, root: &Path, report: &mut Report<'_>) -> Result<()> {
+    let staging = cache.join(".dxvk-extract");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&staging)
+        .arg("--no-same-owner");
+    let result = runner::run(
+        cmd,
+        RunOptions::default().stall(Duration::from_secs(300)),
+        |stream, line| report.line(stream, line),
+    )?;
+    if !result.success() {
+        let _ = fs::remove_dir_all(&staging);
+        bail!("extracting DXVK failed: {}", result.tail_text(10));
+    }
+    let name = root.file_name().context("DXVK folder name")?;
+    let staged = staging.join(name);
+    if !extracted(&staged) {
+        let _ = fs::remove_dir_all(&staging);
+        bail!(
+            "the DXVK archive is missing some of {}",
+            DXVK_DLLS.join(", ")
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+    let moved = fs::rename(&staged, root)
+        .with_context(|| format!("moving {} to {}", staged.display(), root.display()));
+    let _ = fs::remove_dir_all(&staging);
+    moved
 }
 
 /// Remove the DLLs and overrides if a previous install enabled DXVK.
@@ -145,13 +264,12 @@ where
 {
     let mut sink = on_line;
     let mut report = Report::new(log_path, &mut sink);
-    let Some(version) = config::read_prefix_state(prefix, ".dxvk_version") else {
-        return Ok(());
-    };
     let wine_dir = prefix.join(WINE_DIR_NAME);
-    let wine = wine_dir.join("bin/wine");
-    report.info(format!("removing DXVK {version}"));
     if dry_run {
+        let Some(version) = config::read_prefix_state(prefix, ".dxvk_version") else {
+            return Ok(());
+        };
+        report.info(format!("removing DXVK {version}"));
         report.info("    remove the DXVK DLLs from system32 and syswow64");
         report.info("    delete their DllOverrides entries");
         report.info(format!(
@@ -161,8 +279,18 @@ where
         ));
         return Ok(());
     }
+    remove_installed(prefix, &wine_dir, &mut report);
+    Ok(())
+}
 
-    wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
+/// Remove DXVK when the prefix records an installed version.
+fn remove_installed(prefix: &Path, wine_dir: &Path, report: &mut Report<'_>) {
+    let Some(version) = config::read_prefix_state(prefix, ".dxvk_version") else {
+        return;
+    };
+    let wine = wine_dir.join("bin/wine");
+    report.info(format!("removing DXVK {version}"));
+    wine::kill_prefix(prefix, Some(wine_dir), report);
     for dll in DXVK_DLLS {
         let _ = fs::remove_file(prefix.join("drive_c/windows/system32").join(dll));
         let _ = fs::remove_file(prefix.join("drive_c/windows/syswow64").join(dll));
@@ -175,13 +303,12 @@ where
             dll.trim_end_matches(".dll"),
             "/f",
         ]);
-        run_quiet(&mut report, cmd, prefix, &wine_dir);
+        run_quiet(report, cmd, prefix, wine_dir);
     }
     // Restore Wine's builtin DLL placeholders in system32 and syswow64.
-    wine::run_wineboot_update(prefix, &wine_dir, &mut report);
+    wine::run_wineboot_update(prefix, wine_dir, report);
     let _ = fs::remove_file(config::prefix_state_path(prefix, ".dxvk_version"));
     report.info("DXVK removed");
-    Ok(())
 }
 
 fn set_override(prefix: &Path, wine: &Path, wine_dir: &Path, name: &str, report: &mut Report<'_>) {
@@ -216,17 +343,19 @@ fn run_quiet(report: &mut Report<'_>, cmd: Command, prefix: &Path, wine_dir: &Pa
     let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
 }
 
-fn latest_version() -> Option<String> {
-    let url = format!("https://api.github.com/repos/{DXVK_REPO}/releases/latest");
-    let text = http::fetch_text(&url).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let tag = value.get("tag_name")?.as_str()?;
-    Some(tag.trim().trim_start_matches('v').to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_the_release_the_driver_supports() {
+        assert_eq!(release_for(Some((1, 4))).unwrap().version, "3.1.1");
+        assert_eq!(release_for(Some((2, 0))).unwrap().version, "3.1.1");
+        assert_eq!(release_for(Some((1, 3))).unwrap().version, "2.7.1");
+        assert!(release_for(Some((1, 2))).is_none());
+        assert!(release_for(None).is_none());
+        assert!(RELEASES.iter().all(|release| release.sha256.len() == 64));
+    }
 
     #[test]
     fn dry_run_does_not_create_files() {
@@ -234,12 +363,43 @@ mod tests {
         let prefix = dir.path().join("prefix");
         fs::create_dir_all(&prefix).unwrap();
         let mut lines = Vec::new();
-        install(&prefix, true, None, |_, line| lines.push(line.to_string())).unwrap();
+        install_for(&prefix, Some((1, 3)), true, None, |_, line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
         let text = lines.join("\n");
-        assert!(text.contains("dxvk"));
+        assert!(text.contains("dxvk-2.7.1.tar.gz"));
+        assert!(text.contains("sha256sum"));
         assert!(text.contains("/v d3d11 "));
         assert!(text.contains("/v dxgi "));
         assert!(!prefix.join(".cache").exists());
+    }
+
+    #[test]
+    fn dry_run_without_vulkan_skips_dxvk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = Vec::new();
+        let version = install_for(dir.path(), None, true, None, |_, line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        assert!(version.is_none());
+        assert!(lines.join("\n").contains("skip DXVK"));
+    }
+
+    #[test]
+    fn partial_extraction_is_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dxvk-3.1.1");
+        fs::create_dir_all(root.join("x64")).unwrap();
+        fs::create_dir_all(root.join("x32")).unwrap();
+        fs::write(root.join("x64/d3d9.dll"), b"MZ").unwrap();
+        assert!(!extracted(&root));
+        for dll in DXVK_DLLS {
+            fs::write(root.join("x64").join(dll), b"MZ").unwrap();
+            fs::write(root.join("x32").join(dll), b"MZ").unwrap();
+        }
+        assert!(extracted(&root));
     }
 
     #[test]
@@ -259,10 +419,5 @@ mod tests {
         })
         .unwrap();
         assert!(lines.join("\n").contains("wineboot -u"));
-    }
-
-    #[test]
-    fn strips_the_release_prefix() {
-        assert_eq!("v3.1.1".trim_start_matches('v'), "3.1.1");
     }
 }
