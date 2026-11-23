@@ -710,7 +710,10 @@ fn run_launch(
         let log_dir = prefix.join("logs");
         fs::create_dir_all(&log_dir)?;
         let path = log_dir.join("launch.log");
-        let _ = fs::write(&path, b"");
+        // A link goes to the running FL Studio; keep that launch's log.
+        if !args.iter().any(|arg| launch::is_url(arg)) {
+            let _ = fs::write(&path, b"");
+        }
         Some(path)
     };
     let options = launch::LaunchOptions {

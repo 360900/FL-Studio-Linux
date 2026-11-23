@@ -759,7 +759,6 @@ pub(crate) fn wine_env(prefix: &Path, wine_dir: &Path, debug: &str) -> Vec<(Stri
     vec![
         ("WINEPREFIX".into(), prefix.display().to_string()),
         ("WINEDEBUG".into(), debug.into()),
-        ("WINESERVER_TIMEOUT".into(), "60".into()),
         ("WINETRICKS_GUI".into(), "none".into()),
         (
             "WINEDLLPATH".into(),
@@ -775,7 +774,7 @@ pub(crate) fn wine_env(prefix: &Path, wine_dir: &Path, debug: &str) -> Vec<(Stri
         ),
         (
             "PATH".into(),
-            format!("{}:{path}", wine_dir.join("bin").display()),
+            crate::launch::prepend_path(&wine_dir.join("bin"), &path),
         ),
     ]
 }

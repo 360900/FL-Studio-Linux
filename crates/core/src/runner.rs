@@ -157,18 +157,8 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let program = cmd.get_program().to_string_lossy().to_string();
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn {program}"))?;
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<(Stream, String)>();
-    spawn_reader(stdout, Stream::Stdout, tx.clone());
-    spawn_reader(stderr, Stream::Stderr, tx.clone());
-    drop(tx);
-
+    // Open the log first: failing after the spawn would leave the child
+    // running with nobody reading its pipes.
     let mut log = match &opts.log_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -191,11 +181,26 @@ where
         None => None,
     };
 
+    let program = cmd.get_program().to_string_lossy().to_string();
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {program}"))?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel::<(Stream, String)>();
+    spawn_reader(stdout, Stream::Stdout, tx.clone());
+    spawn_reader(stderr, Stream::Stderr, tx.clone());
+    drop(tx);
+
     let mut stdout_tail = VecDeque::new();
     let mut stderr_tail = VecDeque::new();
     let mut last_output = Instant::now();
     let mut stalled = false;
     let mut cancelled = false;
+    // An elevated child (sudo, pkexec) cannot be killed by us; stop trying
+    // and wait for it instead of reporting a stall it never had.
+    let mut unkillable = false;
     let mut status: Option<ExitStatus> = None;
     let mut finished_at: Option<Instant> = None;
     let mut disconnected = false;
@@ -227,23 +232,29 @@ where
 
         if status.is_none()
             && !cancelled
+            && !unkillable
             && opts
                 .cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
-            cancelled = true;
-            let _ = child.kill();
+            match child.kill() {
+                Ok(()) => cancelled = true,
+                Err(_) => unkillable = true,
+            }
         }
 
         if status.is_none()
             && !stalled
             && !cancelled
+            && !unkillable
             && let Some(limit) = opts.stall_timeout
             && last_output.elapsed() >= limit
         {
-            stalled = true;
-            let _ = child.kill();
+            match child.kill() {
+                Ok(()) => stalled = true,
+                Err(_) => unkillable = true,
+            }
         }
 
         if let Some(at) = finished_at
@@ -443,6 +454,21 @@ mod tests {
         .unwrap();
         assert!(result.stalled);
         assert!(started.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn an_unopenable_log_fails_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let marker = dir.path().join("ran");
+        let result = run(
+            sh(&format!("touch {}", marker.display())),
+            RunOptions::default().quiet().log(blocker.join("run.log")),
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        assert!(!marker.exists());
     }
 
     #[test]

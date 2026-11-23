@@ -95,9 +95,10 @@ where
         });
     }
 
-    // Keep Wine's errors: they are the only clue when a plugin crashes.
-    attach_log(&mut cmd);
-    let child = cmd
+    // Keep Wine's errors: they are the only clue when a plugin crashes. A
+    // link handed to a running FL Studio keeps that instance's log.
+    attach_log(&mut cmd, !urls);
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("starting {}", program.display()))?;
     report.info(format!(
@@ -105,13 +106,18 @@ where
         display_target.display(),
         child.id()
     ));
+    // Reap the process when it exits, so a long-running GUI collects no
+    // zombies. A CLI that exits first hands it to init instead.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(LaunchOutcome {
         target: display_target,
         args,
     })
 }
 
-fn is_url(arg: &str) -> bool {
+pub fn is_url(arg: &str) -> bool {
     arg.starts_with("flstudio://") || arg.starts_with("fl-cloud-plugins://")
 }
 
@@ -136,7 +142,7 @@ fn windows_path(prefix: &Path, wine_dir: &Path, path: &Path) -> Option<String> {
         .env("WINEDEBUG", "-all")
         // Keep winepath on the prefix's Wine so it starts the private
         // wineserver instead of the system one.
-        .env("PATH", format!("{}/bin:{search_path}", wine_dir.display()))
+        .env("PATH", prepend_path(&wine_dir.join("bin"), &search_path))
         .env("WINE", wine_dir.join("bin/wine"))
         .env("WINESERVER", wine_dir.join("bin/wineserver"))
         .env("WINEDLLPATH", wine_dir.join("lib/wine"))
@@ -154,9 +160,8 @@ fn launch_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
     let mut envs = vec![
         ("WINEPREFIX".into(), prefix.display().to_string()),
         // Errors only: keep crash lines without drowning the log in fixmes.
-        ("WINEDEBUG".into(), "-all,+err".into()),
-        ("WINESERVER_TIMEOUT".into(), "60".into()),
-        ("PATH".into(), format!("{}/bin:{path}", wine_dir.display())),
+        ("WINEDEBUG".into(), "-all,err+all".into()),
+        ("PATH".into(), prepend_path(&wine_dir.join("bin"), &path)),
         (
             "WINE".into(),
             wine_dir.join("bin/wine").display().to_string(),
@@ -169,17 +174,19 @@ fn launch_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
             "WINEDLLPATH".into(),
             wine_dir.join("lib/wine").display().to_string(),
         ),
-        // FL Studio and its plugins are X11 clients; Wine uses XWayland on Wayland.
-        (
-            "DISPLAY".into(),
-            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string()),
-        ),
         ("WINEDLLOVERRIDES".into(), "winemenubuilder.exe=d".into()),
         // NVIDIA blocks each OpenGL plugin's buffer swap on vblank otherwise.
         ("__GL_SYNC_TO_VBLANK".into(), "0".into()),
         ("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP".into(), "0".into()),
         ("__GL_SHADER_DISK_CACHE".into(), "1".into()),
     ];
+    // FL Studio and its plugins are X11 clients; Wine uses XWayland on
+    // Wayland. Without a DISPLAY, Wine picks its own driver.
+    if let Ok(display) = std::env::var("DISPLAY")
+        && !display.is_empty()
+    {
+        envs.push(("DISPLAY".into(), display));
+    }
     if let Ok(xauthority) = std::env::var("XAUTHORITY") {
         envs.push(("XAUTHORITY".into(), xauthority));
     }
@@ -190,9 +197,19 @@ fn launch_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
     envs
 }
 
+/// `dir` in front of a `PATH` value, without an empty entry (which would
+/// mean the current directory) when `path` is empty.
+pub(crate) fn prepend_path(dir: &Path, path: &str) -> String {
+    if path.is_empty() {
+        dir.display().to_string()
+    } else {
+        format!("{}:{path}", dir.display())
+    }
+}
+
 /// Wine writes plugin crash reports to stderr. A menu launch has no terminal,
 /// so keep the last run in the cache instead.
-fn attach_log(cmd: &mut Command) {
+fn attach_log(cmd: &mut Command, truncate: bool) {
     let Ok(dir) = http::cache_dir() else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         return;
@@ -201,7 +218,9 @@ fn attach_log(cmd: &mut Command) {
     let log = dir.join("launch.log");
     match OpenOptions::new().create(true).append(true).open(&log) {
         Ok(file) => {
-            let _ = file.set_len(0);
+            if truncate {
+                let _ = file.set_len(0);
+            }
             match file.try_clone() {
                 Ok(errors) => {
                     cmd.stdout(Stdio::from(file)).stderr(Stdio::from(errors));
@@ -360,6 +379,15 @@ mod tests {
     }
 
     #[test]
+    fn path_has_no_empty_entry() {
+        assert_eq!(prepend_path(Path::new("/w/bin"), ""), "/w/bin");
+        assert_eq!(
+            prepend_path(Path::new("/w/bin"), "/usr/bin"),
+            "/w/bin:/usr/bin"
+        );
+    }
+
+    #[test]
     fn recognizes_fl_studio_processes() {
         let cmdline = b"C:\\Program Files\\Image-Line\\FL Studio 2026\\FL64.exe\0";
         assert!(is_fl_process("wine64-preload", cmdline));
@@ -386,7 +414,8 @@ mod tests {
             envs.iter()
                 .any(|(env_key, env_value)| env_key == key && env_value == value)
         };
-        assert!(has("WINEDEBUG", "-all,+err"));
+        assert!(has("WINEDEBUG", "-all,err+all"));
+        assert!(!envs.iter().any(|(key, _)| key == "WINESERVER_TIMEOUT"));
         assert!(has("__GL_SYNC_TO_VBLANK", "0"));
         assert!(has("WINEDLLOVERRIDES", "winemenubuilder.exe=d"));
     }
