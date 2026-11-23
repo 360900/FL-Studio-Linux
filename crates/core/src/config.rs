@@ -83,10 +83,15 @@ pub fn validate_prefix(path: &Path) -> Result<()> {
         anyhow::bail!("the prefix must not contain '..': {}", path.display());
     }
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let home = home_dir();
+    let home_resolved = home.canonicalize().unwrap_or_else(|_| home.clone());
     let forbidden = [
         "/", "/home", "/root", "/usr", "/etc", "/var", "/opt", "/boot", "/srv", "/tmp",
     ];
-    if forbidden.iter().any(|dir| resolved == Path::new(dir)) || resolved == home_dir() {
+    if forbidden.iter().any(|dir| resolved == Path::new(dir))
+        || resolved == home
+        || resolved == home_resolved
+    {
         anyhow::bail!("refusing to use {} as the FL Studio prefix", path.display());
     }
     Ok(())

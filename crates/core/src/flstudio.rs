@@ -15,7 +15,7 @@ use anyhow::Result;
 use crate::audio::AudioDriver;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
-use crate::{WINE_DIR_NAME, app_install_dir};
+use crate::{WINE_DIR_NAME, app_install_dir, wine};
 
 pub fn configure<F>(
     prefix: &Path,
@@ -37,16 +37,16 @@ where
     }
 
     report.info(format!("FL Studio settings: {key}"));
+    let audio = format!("{key}\\Devices\\Audio output");
     let installed = dry_run
         || crate::config::read_prefix_state(prefix, ".audio_driver").as_deref()
             == Some(driver.label());
     if let Some(device) = driver.fl_device()
         && installed
     {
-        let audio = format!("{key}\\Devices\\Audio output");
         reg_add(
             prefix,
-            &wine,
+            &wine_dir,
             "Device name",
             device,
             &audio,
@@ -55,7 +55,7 @@ where
         )?;
         reg_add(
             prefix,
-            &wine,
+            &wine_dir,
             "Sample rate",
             "48000",
             &audio,
@@ -64,13 +64,15 @@ where
         )?;
         reg_add(
             prefix,
-            &wine,
+            &wine_dir,
             "Buffer length (DS)",
             "256",
             &audio,
             dry_run,
             &mut report,
         )?;
+    } else if driver == AudioDriver::None {
+        clear_winepipe_device(prefix, &wine_dir, &audio, dry_run, &mut report)?;
     }
 
     // These are PipeWire's internal sequencer clients, not MIDI hardware.
@@ -82,8 +84,16 @@ where
         "Midi Through Port-0",
     ] {
         let key = format!("{key}\\Devices\\MIDI input\\{name}");
-        reg_add(prefix, &wine, "Enabled", "0", &key, dry_run, &mut report)?;
-        reg_add(prefix, &wine, "Port", "-1", &key, dry_run, &mut report)?;
+        reg_add(
+            prefix,
+            &wine_dir,
+            "Enabled",
+            "0",
+            &key,
+            dry_run,
+            &mut report,
+        )?;
+        reg_add(prefix, &wine_dir, "Port", "-1", &key, dry_run, &mut report)?;
     }
 
     // With no hardware controller, FL's input scan still opens the failing
@@ -97,7 +107,7 @@ where
     });
     reg_add(
         prefix,
-        &wine,
+        &wine_dir,
         "Enable MIDI input",
         if hardware { "1" } else { "0" },
         &format!("{key}\\General"),
@@ -155,17 +165,66 @@ fn fl_key(prefix: &Path) -> String {
     format!("HKCU\\Software\\Image-Line\\FL Studio {major}")
 }
 
+fn clear_winepipe_device(
+    prefix: &Path,
+    wine_dir: &Path,
+    audio_key: &str,
+    dry_run: bool,
+    report: &mut Report<'_>,
+) -> Result<()> {
+    let wine_bin = wine_dir.join("bin/wine");
+    let Some(winepipe_device) = AudioDriver::WinePipe.fl_device() else {
+        return Ok(());
+    };
+    if dry_run {
+        report.info(format!(
+            "    WINEPREFIX={} {} reg delete {} /v 'Device name' /f (if set to {winepipe_device})",
+            prefix.display(),
+            wine_bin.display(),
+            audio_key
+        ));
+        return Ok(());
+    }
+    let mut query = Command::new(&wine_bin);
+    query.args(["reg", "query", audio_key, "/v", "Device name"]);
+    let mut options = RunOptions::default().stall(Duration::from_secs(60)).quiet();
+    options.envs = wine::wine_env(prefix, wine_dir, "-all");
+    let Ok(result) = runner::run(query, options, |stream, line| report.line(stream, line)) else {
+        return Ok(());
+    };
+    if !result.success()
+        || !result
+            .stdout_tail
+            .iter()
+            .any(|line| line.contains(winepipe_device))
+    {
+        return Ok(());
+    }
+    let mut del = Command::new(&wine_bin);
+    del.args(["reg", "delete", audio_key, "/v", "Device name", "/f"]);
+    let mut options = RunOptions::default().stall(Duration::from_secs(60));
+    options.envs = wine::wine_env(prefix, wine_dir, "-all");
+    let result = runner::run(del, options, |stream, line| report.line(stream, line))?;
+    if !result.success() {
+        report.warn(format!(
+            "could not clear {audio_key}\\Device name; continuing"
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reg_add(
     prefix: &Path,
-    wine: &Path,
+    wine_dir: &Path,
     name: &str,
     value: &str,
     key: &str,
     dry_run: bool,
     report: &mut Report<'_>,
 ) -> Result<()> {
-    let mut cmd = Command::new(wine);
+    let wine_bin = wine_dir.join("bin/wine");
+    let mut cmd = Command::new(&wine_bin);
     cmd.args([
         "reg", "add", key, "/v", name, "/t", "REG_SZ", "/d", value, "/f",
     ]);
@@ -173,7 +232,7 @@ fn reg_add(
         report.info(format!(
             "    WINEPREFIX={} {} reg add {} /v '{}' /d '{}' /f",
             prefix.display(),
-            wine.display(),
+            wine_bin.display(),
             key,
             name,
             value
@@ -181,17 +240,7 @@ fn reg_add(
         return Ok(());
     }
     let mut options = RunOptions::default().stall(Duration::from_secs(60));
-    options = options.env("WINEPREFIX", prefix.display().to_string());
-    options = options.env("WINEDEBUG", "-all");
-    options = options.env("WINESERVER_TIMEOUT", "60");
-    options = options.env(
-        "WINEDLLPATH",
-        prefix
-            .join(WINE_DIR_NAME)
-            .join("lib/wine")
-            .display()
-            .to_string(),
-    );
+    options.envs = wine::wine_env(prefix, wine_dir, "-all");
     let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
     if !result.success() {
         report.warn(format!("could not set {key}\\{name}; continuing"));
@@ -257,5 +306,18 @@ mod tests {
 
         let keyboard = format!("{virtual_only}Client 148 : \"Arturia MiniLab 3\" [User Legacy]\n");
         assert!(hardware_midi_in(&keyboard));
+    }
+
+    #[test]
+    fn dry_run_none_clears_winepipe_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = Vec::new();
+        configure(dir.path(), AudioDriver::None, true, None, |_, line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        let text = lines.join("\n");
+        assert!(text.contains("reg delete"));
+        assert!(text.contains("Device name"));
     }
 }

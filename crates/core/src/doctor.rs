@@ -36,15 +36,15 @@ pub struct DoctorReport {
 pub fn run(cfg: &Config) -> DoctorReport {
     let mut errors = Vec::new();
 
-    let os = OsRelease::detect().unwrap_or_else(|err| {
-        errors.push(format!("os-release: {err:#}"));
-        OsRelease::default()
-    });
-
-    let family = match cfg.distro_override.as_deref() {
-        Some(over) => override_family(over),
-        None => os.family(),
+    let os = match cfg.distro_override.as_deref() {
+        Some(over) if !over.trim().is_empty() => OsRelease::from_override(over),
+        _ => OsRelease::detect().unwrap_or_else(|err| {
+            errors.push(format!("os-release: {err:#}"));
+            OsRelease::default()
+        }),
     };
+
+    let family = os.family();
 
     let package_manager = {
         let pm = family.package_manager();
@@ -112,16 +112,5 @@ pub fn run(cfg: &Config) -> DoctorReport {
         webview2: components::webview2_installed(&cfg.prefix),
         manifest,
         errors,
-    }
-}
-
-fn override_family(value: &str) -> Family {
-    match value.to_ascii_lowercase().as_str() {
-        "arch" | "cachyos" => Family::Arch,
-        "ubuntu" => Family::Ubuntu,
-        "debian" => Family::Debian,
-        "fedora" => Family::Fedora,
-        "suse" | "opensuse" => Family::Suse,
-        _ => Family::Unknown,
     }
 }

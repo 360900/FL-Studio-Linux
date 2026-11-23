@@ -16,9 +16,10 @@ use crate::WINE_DIR_NAME;
 use crate::http;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
+use crate::wine;
 
-const MSGOTHIC_URL: &str =
-    "https://raw.githubusercontent.com/FSKiller/Microsoft-Fonts/main/msgothic.ttc";
+const MSGOTHIC_URL: &str = "https://raw.githubusercontent.com/FSKiller/Microsoft-Fonts/ae52d80fedcac1a18df43728f9fc4d8bf3c31663/msgothic.ttc";
+const MSGOTHIC_SHA256: &str = "4bde3e6392b96910fb59094c6c1a4dbfae18fee78d0bf13dc30616837c4f95db";
 const WEBVIEW2_URL: &str = "https://go.microsoft.com/fwlink/?linkid=2124701";
 const WEBVIEW2_INSTALLER: &str = "MicrosoftEdgeWebView2RuntimeInstallerX64.exe";
 const MSGOTHIC_NAME: &str = "msgothic.ttc";
@@ -72,15 +73,27 @@ pub fn ensure_fonts<F>(
     dry_run: bool,
     log_path: Option<PathBuf>,
     on_line: F,
-) -> Result<bool>
+) -> Result<ComponentReport>
 where
     F: FnMut(Stream, &str),
 {
     let mut sink = on_line;
     let mut report = Report::new(log_path, &mut sink);
     let fonts = install_fonts(prefix, dry_run, &mut report)?;
-    let _ = install_msgothic(prefix, dry_run, &mut report)?;
-    Ok(fonts)
+    let msgothic = install_msgothic(prefix, dry_run, &mut report)?;
+    let mut failures = Vec::new();
+    if !fonts {
+        failures.push("Microsoft fonts".to_string());
+    }
+    if !msgothic {
+        failures.push("MS Gothic".to_string());
+    }
+    Ok(ComponentReport {
+        fonts,
+        msgothic,
+        runtimes: false,
+        failures,
+    })
 }
 
 /// Repair path: reinstall the plugin runtimes in case an earlier attempt
@@ -170,11 +183,11 @@ fn winetricks(prefix: &Path, component: &str, report: &mut Report<'_>) -> Result
         "--force",
         component,
     ]);
-    kill_prefix(prefix, &wine_dir, report)?;
-    let mut options = wine_env(prefix, &wine_dir);
-    options.stall_timeout = Some(Duration::from_secs(1800));
+    wine::kill_prefix(prefix, Some(&wine_dir), report);
+    let mut options = RunOptions::default().stall(Duration::from_secs(1800));
+    options.envs = wine::wine_env(prefix, &wine_dir, "-all,fixme-all");
     let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
-    let _ = kill_prefix(prefix, &wine_dir, report);
+    wine::kill_prefix(prefix, Some(&wine_dir), report);
     Ok(result.success())
 }
 
@@ -188,7 +201,11 @@ fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Re
     if dry_run {
         let cached = http::cache_dir()?.join(MSGOTHIC_NAME);
         report.info(format!(
-            "    curl -fLR -z {0} -o {0} {MSGOTHIC_URL}",
+            "    curl -fLR -o {} {MSGOTHIC_URL}",
+            cached.display()
+        ));
+        report.info(format!(
+            "    echo '{MSGOTHIC_SHA256}  {}' | sha256sum -c -",
             cached.display()
         ));
         report.info(format!(
@@ -204,10 +221,11 @@ fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Re
         return Ok(true);
     }
 
-    let cached = match http::download_cached(
+    let cached = match http::download_verified(
         report,
         MSGOTHIC_URL,
         MSGOTHIC_NAME,
+        MSGOTHIC_SHA256,
         Duration::from_secs(300),
     ) {
         Ok(cached) => cached,
@@ -230,18 +248,7 @@ fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Re
     }
 
     // Wine builds its font registry during wineboot.
-    let wineboot = prefix.join(WINE_DIR_NAME).join("bin/wineboot");
-    if wineboot.is_file() {
-        let mut cmd = Command::new(&wineboot);
-        cmd.arg("-u");
-        let mut options = wine_env(prefix, &prefix.join(WINE_DIR_NAME));
-        options.stall_timeout = Some(Duration::from_secs(300));
-        options.envs.push((
-            "WINEDLLOVERRIDES".into(),
-            "mscoree=;mshtml=;winemenubuilder.exe=d;winegstreamer=".into(),
-        ));
-        let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
-    }
+    wine::run_wineboot_update(prefix, &prefix.join(WINE_DIR_NAME), report);
     report.info(format!("MS Gothic installed at {}", destination.display()));
     Ok(destination.is_file())
 }
@@ -306,20 +313,41 @@ where
     };
     let wine_dir = prefix.join(WINE_DIR_NAME);
     let wine = wine_dir.join("bin/wine");
-    kill_prefix(prefix, &wine_dir, &mut report)?;
+    wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
     let mut cmd = Command::new(&wine);
     cmd.arg(&installer).args(["/silent", "/install"]);
-    let mut options = wine_env(prefix, &wine_dir);
-    options.stall_timeout = Some(Duration::from_secs(1800));
-    let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
-    // The bootstrapper can return before the runtime appears.
-    for _ in 0..150 {
+    let mut options = RunOptions::default().stall(Duration::from_secs(1800));
+    options.envs = wine::wine_env(prefix, &wine_dir, "-all,fixme-all");
+    let run_result = match runner::run(cmd, options, |stream, line| report.line(stream, line)) {
+        Ok(result) => result,
+        Err(error) => {
+            report.warn(format!("could not run WebView2 installer: {error:#}"));
+            return Ok(false);
+        }
+    };
+    if run_result.stalled {
+        wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
+        report.warn("WebView2 installer stalled");
+        return Ok(webview2_installed(prefix));
+    }
+    // The bootstrapper can return before the runtime appears. On non-zero
+    // exit, only wait briefly instead of stalling for five minutes.
+    let max_polls = if run_result.status.success() {
+        150
+    } else {
+        report.warn(format!(
+            "WebView2 installer exited with {}",
+            run_result.status
+        ));
+        8
+    };
+    for _ in 0..max_polls {
         if webview2_installed(prefix) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    let _ = kill_prefix(prefix, &wine_dir, &mut report);
+    wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
     if webview2_installed(prefix) {
         report.info("WebView2 installed");
         Ok(true)
@@ -343,38 +371,6 @@ pub fn webview2_installed(prefix: &Path) -> bool {
         .flatten()
         .flatten()
         .any(|entry| entry.path().join("msedgewebview2.exe").is_file())
-}
-
-fn wine_env(prefix: &Path, wine_dir: &Path) -> RunOptions {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let mut options = RunOptions::default();
-    options = options.env("WINEPREFIX", prefix.display().to_string());
-    options = options.env("WINEDEBUG", "-all,fixme-all");
-    options = options.env("WINESERVER_TIMEOUT", "60");
-    options = options.env("WINETRICKS_GUI", "none");
-    options = options.env("PATH", format!("{}:{path}", wine_dir.join("bin").display()));
-    options = options.env("WINE", wine_dir.join("bin/wine").display().to_string());
-    options = options.env(
-        "WINESERVER",
-        wine_dir.join("bin/wineserver").display().to_string(),
-    );
-    options
-}
-
-fn kill_prefix(prefix: &Path, wine_dir: &Path, report: &mut Report<'_>) -> Result<()> {
-    let wineserver = wine_dir.join("bin/wineserver");
-    let mut cmd = if wineserver.is_file() {
-        Command::new(wineserver)
-    } else if let Some(path) = crate::deps::which("wineserver") {
-        Command::new(path)
-    } else {
-        return Ok(());
-    };
-    cmd.arg("-k");
-    let mut options = RunOptions::default().stall(Duration::from_secs(30)).quiet();
-    options = options.env("WINEPREFIX", prefix.display().to_string());
-    let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
-    Ok(())
 }
 
 #[cfg(test)]

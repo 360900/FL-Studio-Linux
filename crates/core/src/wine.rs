@@ -93,11 +93,11 @@ where
         ));
     } else {
         report.info("initializing the Wine prefix");
-        kill_prefix(prefix, Some(&wine_dir), &mut report)?;
+        kill_prefix(prefix, Some(&wine_dir), &mut report);
         let mut cmd = Command::new(wine_dir.join("bin/wineboot"));
         cmd.arg("-u");
         let mut run_opts = stream_opts(Some(Duration::from_secs(900)));
-        run_opts.envs = wine_env(prefix, &wine_dir);
+        run_opts.envs = wine_env(prefix, &wine_dir, "-all,fixme-all");
         // Gecko, Mono and winegstreamer are not needed for FL Studio and can
         // hang a fresh wineboot on systems with gst-editing-services.
         run_opts.envs.push(("WINEARCH".into(), "win64".into()));
@@ -193,11 +193,11 @@ fn set_windows_11(
         report.warn(format!("{} is missing", winecfg.display()));
         return Ok(());
     }
-    kill_prefix(prefix, Some(wine_dir), report)?;
+    kill_prefix(prefix, Some(wine_dir), report);
     let mut cmd = Command::new(&winecfg);
     cmd.args(["-v", "win11"]);
     let mut run_opts = stream_opts(Some(Duration::from_secs(300)));
-    run_opts.envs = wine_env(prefix, wine_dir);
+    run_opts.envs = wine_env(prefix, wine_dir, "-all,fixme-all");
     let result = run_logged(report, cmd, run_opts)?;
     if !result.success() {
         report.warn("winecfg failed to set Windows 11; continuing");
@@ -344,7 +344,7 @@ fn reg_add(
         return Ok(());
     }
     let mut run_opts = stream_opts(Some(Duration::from_secs(120)));
-    run_opts.envs = wine_env(prefix, wine_dir);
+    run_opts.envs = wine_env(prefix, wine_dir, "-all,fixme-all");
     let result = run_logged(report, cmd, run_opts)?;
     if !result.success() {
         report.warn(format!("could not set {key}\\{name}; continuing"));
@@ -361,7 +361,7 @@ fn ensure_wine(
     if let Some(existing) = detect_installed_build(prefix) {
         let usable = supports_fl(&existing);
         let compatible = requested
-            .map(|requested| existing.starts_with(requested))
+            .map(|requested| existing == requested)
             .unwrap_or(true);
         if usable && compatible {
             report.info(format!("using existing Wine {existing}"));
@@ -512,15 +512,19 @@ fn install_wine(
         };
 
         report.info(format!("extracting Wine {version}"));
+        let staging = prefix.join(format!(".wine-extract-{version}"));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
         let mut cmd = Command::new("tar");
         cmd.args(["-xJf"])
             .arg(&archive)
             .arg("-C")
-            .arg(prefix)
+            .arg(&staging)
             .args(["--no-same-owner", "--overwrite"]);
         let run_opts = stream_opts(Some(Duration::from_secs(1800)));
         let result = run_logged(report, cmd, run_opts)?;
         if !result.success() {
+            let _ = fs::remove_dir_all(&staging);
             let _ = fs::remove_file(&archive);
             report.warn(format!(
                 "Wine {version} extraction failed\n{}",
@@ -530,7 +534,8 @@ fn install_wine(
             continue;
         }
 
-        let Some(dir) = find_wine_dir(prefix, version) else {
+        let Some(staged_dir) = find_wine_dir(&staging, version) else {
+            let _ = fs::remove_dir_all(&staging);
             report.warn(format!(
                 "Wine {version} archive did not contain {}",
                 release.dir_pattern
@@ -538,6 +543,19 @@ fn install_wine(
             errors.push(format!("{version}: archive layout not recognized"));
             continue;
         };
+
+        let dir_name = staged_dir
+            .file_name()
+            .context("extracted Wine directory name")?
+            .to_os_string();
+        let dir = prefix.join(dir_name);
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let move_res = fs::rename(&staged_dir, &dir)
+            .with_context(|| format!("moving {} to {}", staged_dir.display(), dir.display()));
+        let _ = fs::remove_dir_all(&staging);
+        move_res?;
 
         link_wine(prefix, &dir)?;
         verify_wine(prefix, dry_run, report)?;
@@ -551,27 +569,13 @@ fn install_wine(
 }
 
 fn fetch_archive(report: &mut Report<'_>, release: &Release) -> Result<PathBuf> {
-    let archive = http::download_cached(
+    http::download_verified(
         report,
         &release.url,
         &release.file_name,
+        &release.sha256,
         Duration::from_secs(600),
-    )?;
-    let hash = http::sha256_file(&archive)?;
-    if hash == release.sha256 {
-        return Ok(archive);
-    }
-    report.warn(format!(
-        "{} failed its SHA-256 check; downloading it again",
-        release.file_name
-    ));
-    let _ = fs::remove_file(&archive);
-    http::download(report, &release.url, &archive, Duration::from_secs(600))?;
-    if http::sha256_file(&archive)? != release.sha256 {
-        let _ = fs::remove_file(&archive);
-        bail!("the Wine archive failed its SHA-256 check twice");
-    }
-    Ok(archive)
+    )
 }
 
 fn release_for(version: &str) -> Result<Release> {
@@ -655,7 +659,7 @@ fn verify_wine(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Result<
     let mut cmd = Command::new(&wine);
     cmd.arg("--version");
     let mut run_opts = stream_opts(Some(Duration::from_secs(120)));
-    run_opts.envs = wine_env(prefix, &prefix.join(WINE_DIR_NAME));
+    run_opts.envs = wine_env(prefix, &prefix.join(WINE_DIR_NAME), "-all,fixme-all");
     let result = run_logged(report, cmd, run_opts)?;
     if !result.success() {
         bail!(
@@ -667,13 +671,13 @@ fn verify_wine(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Result<
     Ok(())
 }
 
-fn kill_prefix(prefix: &Path, wine_dir: Option<&Path>, report: &mut Report<'_>) -> Result<()> {
+pub(crate) fn kill_prefix(prefix: &Path, wine_dir: Option<&Path>, report: &mut Report<'_>) {
     let wineserver = wine_dir
         .map(|dir| dir.join("bin/wineserver"))
         .filter(|path| path.is_file())
         .or_else(|| deps::which("wineserver"));
     let Some(wineserver) = wineserver else {
-        return Ok(());
+        return;
     };
 
     let mut cmd = Command::new(wineserver);
@@ -683,20 +687,43 @@ fn kill_prefix(prefix: &Path, wine_dir: Option<&Path>, report: &mut Report<'_>) 
     run_opts
         .envs
         .push(("WINEPREFIX".into(), prefix.display().to_string()));
-    let _ = run_logged(report, cmd, run_opts)?;
-    Ok(())
+    let _ = run_logged(report, cmd, run_opts);
 }
 
-fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
+pub(crate) fn run_wineboot_update(prefix: &Path, wine_dir: &Path, report: &mut Report<'_>) {
+    let wineboot = wine_dir.join("bin/wineboot");
+    if !wineboot.is_file() {
+        return;
+    }
+    let mut cmd = Command::new(&wineboot);
+    cmd.arg("-u");
+    let mut options = stream_opts(Some(Duration::from_secs(300)));
+    options.envs = wine_env(prefix, wine_dir, "-all,fixme-all");
+    options.envs.push((
+        "WINEDLLOVERRIDES".into(),
+        "mscoree=;mshtml=;winemenubuilder.exe=d;winegstreamer=".into(),
+    ));
+    let _ = run_logged(report, cmd, options);
+}
+
+pub(crate) fn wine_env(prefix: &Path, wine_dir: &Path, debug: &str) -> Vec<(String, String)> {
     let path = std::env::var("PATH").unwrap_or_default();
     vec![
         ("WINEPREFIX".into(), prefix.display().to_string()),
-        ("WINEDEBUG".into(), "-all,fixme-all".into()),
+        ("WINEDEBUG".into(), debug.into()),
         ("WINESERVER_TIMEOUT".into(), "60".into()),
         ("WINETRICKS_GUI".into(), "none".into()),
         (
             "WINEDLLPATH".into(),
             wine_dir.join("lib/wine").display().to_string(),
+        ),
+        (
+            "WINE".into(),
+            wine_dir.join("bin/wine").display().to_string(),
+        ),
+        (
+            "WINESERVER".into(),
+            wine_dir.join("bin/wineserver").display().to_string(),
         ),
         (
             "PATH".into(),

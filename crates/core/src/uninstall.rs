@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::desktop::{DESKTOP_FILE, ICON_FILE, MIME_FILE, URL_HANDLER_FILE};
+use crate::desktop::{self, DESKTOP_FILE, ICON_FILE, MIME_FILE, URL_HANDLER_FILE};
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
-use crate::{WINE_DIR_NAME, config};
+use crate::{WINE_DIR_NAME, config, wine};
 
 #[derive(Debug, Clone)]
 pub struct UninstallOptions {
@@ -68,10 +68,10 @@ where
     stop_prefix(&opts.prefix, &mut report);
 
     for path in removal_paths() {
-        if !path.exists() {
+        let Ok(metadata) = path.symlink_metadata() else {
             continue;
-        }
-        let result = if path.is_dir() {
+        };
+        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
             fs::remove_dir_all(&path)
         } else {
             fs::remove_file(&path)
@@ -101,7 +101,7 @@ where
             if fs::remove_dir_all(&opts.prefix).is_err() {
                 report.warn("retry failed; falling back to rm -rf");
                 let _ = Command::new("rm")
-                    .arg("-rf")
+                    .args(["-rf", "--"])
                     .arg(&opts.prefix)
                     .status()
                     .context("running rm -rf")?;
@@ -119,33 +119,14 @@ where
         report.info("prefix not found; nothing to delete");
     }
 
-    let reset = config::default_prefix();
-    report.info(format!("install location reset to {}", reset.display()));
     report.info("FL Studio projects and samples outside the prefix were kept");
     Ok(outcome)
 }
 
 fn stop_prefix(prefix: &Path, report: &mut Report<'_>) {
     let wine_dir = prefix.join(WINE_DIR_NAME);
-    let wineserver = if wine_dir.join("bin/wineserver").exists() {
-        wine_dir.join("bin/wineserver")
-    } else {
-        PathBuf::from("wineserver")
-    };
-    if wineserver == Path::new("wineserver") && crate::deps::which("wineserver").is_none() {
-        return;
-    }
-    let mut cmd = Command::new(&wineserver);
-    cmd.arg("-k");
-    cmd.env("WINEPREFIX", prefix);
-    match runner::run(
-        cmd,
-        RunOptions::default().stall(Duration::from_secs(30)).quiet(),
-        |stream, line| report.line(stream, line),
-    ) {
-        Ok(_) => std::thread::sleep(Duration::from_millis(800)),
-        Err(error) => report.warn(format!("could not stop Wine processes: {error}")),
-    }
+    wine::kill_prefix(prefix, Some(&wine_dir), report);
+    std::thread::sleep(Duration::from_millis(800));
 }
 
 fn refresh_databases(report: &mut Report<'_>) {
@@ -180,7 +161,9 @@ fn make_writable(path: &Path) {
     if metadata.file_type().is_symlink() {
         return;
     }
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o777));
+    let add = if metadata.is_dir() { 0o700 } else { 0o600 };
+    let mode = metadata.permissions().mode() | add;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
     if metadata.is_dir()
         && let Ok(entries) = fs::read_dir(path)
     {
@@ -202,8 +185,8 @@ fn removal_paths() -> Vec<PathBuf> {
     paths.push(applications.join("wine-protocol-fl-cloud-plugins.desktop"));
     paths.push(data.join("icons/hicolor/scalable/apps").join(ICON_FILE));
     paths.push(data.join("mime/packages").join(MIME_FILE));
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join("Desktop/FL Studio.desktop"));
+    if let Some(desktop) = desktop::desktop_dir() {
+        paths.push(desktop.join("FL Studio.desktop"));
     }
     paths
 }
@@ -304,5 +287,16 @@ mod tests {
     fn applications_dir_stays_under_xdg_or_home() {
         let dir = applications_dir().expect("applications dir");
         assert!(dir.ends_with("applications"));
+    }
+
+    #[test]
+    fn make_writable_keeps_files_non_world_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("readonly");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
+        make_writable(&file);
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

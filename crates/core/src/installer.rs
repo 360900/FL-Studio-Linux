@@ -17,7 +17,7 @@ use anyhow::{Result, bail};
 use crate::http;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, RunResult, Stream};
-use crate::{WINE_DIR_NAME, app_exe};
+use crate::{WINE_DIR_NAME, app_exe, wine};
 
 pub const INSTALLER_URL: &str = "https://support.image-line.com/redirect/flstudio_win_installer";
 pub const INSTALLER_NAME: &str = "flstudio_win64_installer.exe";
@@ -68,17 +68,27 @@ where
         });
     }
 
-    let envs = wine_env(&opts.prefix, &wine_dir);
-    let before = app_exe(&opts.prefix);
-    let _ = kill_prefix(&wine_dir, &envs, &mut report);
+    let mut envs = wine::wine_env(&opts.prefix, &wine_dir, "-all");
+    envs.push((
+        "WINEDLLOVERRIDES".into(),
+        "winemenubuilder.exe=d;winegstreamer=".into(),
+    ));
+    let before = app_exe(&opts.prefix).map(|path| {
+        let meta = fs::metadata(&path).ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.and_then(|m| m.modified().ok());
+        (path, len, modified)
+    });
+    wine::kill_prefix(&opts.prefix, Some(&wine_dir), &mut report);
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let watchdog = before.is_none().then(|| {
+    let watchdog = {
         let cancel = cancel.clone();
         let prefix = opts.prefix.clone();
         let wine_dir = wine_dir.clone();
-        std::thread::spawn(move || watch_new_install(&prefix, &wine_dir, &cancel))
-    });
+        let baseline = before.clone();
+        std::thread::spawn(move || watch_install(&prefix, &wine_dir, baseline.as_ref(), &cancel))
+    };
 
     report.info("installing silently; WebView2 can take several minutes");
     let mut cmd = installer_command(&wine, &installer);
@@ -88,10 +98,8 @@ where
     let result = run(&mut report, cmd, &envs, Duration::from_secs(1800));
 
     cancel.store(true, Ordering::Relaxed);
-    if let Some(watchdog) = watchdog {
-        let _ = watchdog.join();
-    }
-    let _ = kill_prefix(&wine_dir, &envs, &mut report);
+    let _ = watchdog.join();
+    wine::kill_prefix(&opts.prefix, Some(&wine_dir), &mut report);
     let result = result?;
 
     let Some(fl_exe) = app_exe(&opts.prefix) else {
@@ -101,6 +109,21 @@ where
             result.tail_text(20)
         );
     };
+
+    if let Some((before_path, before_len, before_modified)) = &before {
+        let meta = fs::metadata(&fl_exe).ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.and_then(|m| m.modified().ok());
+        let unchanged =
+            &fl_exe == before_path && len == *before_len && modified == *before_modified;
+        if unchanged && !result.success() && result.status.code() != Some(199) {
+            let code = result.status.code().unwrap_or(-1);
+            bail!(
+                "the FL Studio installer failed without updating FL64.exe (exit {code}).\n{}",
+                result.tail_text(20)
+            );
+        }
+    }
 
     if !result.success() {
         report.warn(format!(
@@ -119,12 +142,16 @@ where
 }
 
 /// Tracks whether the network download is available. Used by `install::prefetch`.
-pub(crate) fn fetch_installer(report: &mut Report<'_>) -> Result<PathBuf> {
-    http::download_cached(
+pub(crate) fn fetch_installer(
+    report: &mut Report<'_>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<PathBuf> {
+    http::download_cached_cancellable(
         report,
         INSTALLER_URL,
         INSTALLER_NAME,
         Duration::from_secs(1800),
+        cancel,
     )
 }
 
@@ -138,7 +165,7 @@ fn resolve_installer(opts: &InstallerOptions, report: &mut Report<'_>) -> Result
             ));
             return Ok(cached);
         }
-        return fetch_installer(report);
+        return fetch_installer(report, None);
     };
 
     if opts.dry_run {
@@ -187,11 +214,17 @@ fn dry_run(
     report.info("    the installer may report exit code 199 after success");
 }
 
-/// Stop the prefix once FL64.exe exists and has not changed for a minute.
-/// The installer starts Edge services that otherwise keep it alive forever.
-fn watch_new_install(prefix: &Path, wine_dir: &Path, cancel: &AtomicBool) {
+/// Stop the prefix once FL64.exe appears (or changes on an update) and has
+/// stopped changing. The installer starts Edge services that otherwise keep
+/// the prefix alive forever.
+fn watch_install(
+    prefix: &Path,
+    wine_dir: &Path,
+    baseline: Option<&(PathBuf, u64, Option<SystemTime>)>,
+    cancel: &AtomicBool,
+) {
     let started = Instant::now();
-    let mut stable: Option<(u64, Option<SystemTime>, Instant)> = None;
+    let mut stable: Option<(PathBuf, u64, Option<SystemTime>, Instant)> = None;
     while !cancel.load(Ordering::Relaxed) {
         if started.elapsed() > Duration::from_secs(45 * 60) {
             return;
@@ -201,25 +234,30 @@ fn watch_new_install(prefix: &Path, wine_dir: &Path, cancel: &AtomicBool) {
         {
             let len = metadata.len();
             let modified = metadata.modified().ok();
-            stable = match stable {
-                Some((last_len, last_modified, since))
-                    if last_len == len && last_modified == modified =>
-                {
-                    // WebView2 still needs to finish after FL64.exe appears;
-                    // wait longer until its runtime shows up.
-                    let grace = if crate::components::webview2_installed(prefix) {
-                        Duration::from_secs(120)
-                    } else {
-                        Duration::from_secs(600)
-                    };
-                    if since.elapsed() >= grace {
-                        stop_prefix(prefix, wine_dir);
-                        return;
+            let still_old = baseline.is_some_and(|(old_path, old_len, old_modified)| {
+                &exe == old_path && len == *old_len && modified == *old_modified
+            });
+            if !still_old {
+                stable = match stable {
+                    Some((last_exe, last_len, last_modified, since))
+                        if last_exe == exe && last_len == len && last_modified == modified =>
+                    {
+                        // WebView2 still needs to finish after FL64.exe appears;
+                        // wait longer until its runtime shows up.
+                        let grace = if crate::components::webview2_installed(prefix) {
+                            Duration::from_secs(120)
+                        } else {
+                            Duration::from_secs(600)
+                        };
+                        if since.elapsed() >= grace {
+                            stop_prefix(prefix, wine_dir);
+                            return;
+                        }
+                        Some((last_exe, last_len, last_modified, since))
                     }
-                    Some((last_len, last_modified, since))
-                }
-                _ => Some((len, modified, Instant::now())),
-            };
+                    _ => Some((exe, len, modified, Instant::now())),
+                };
+            }
         }
         std::thread::sleep(Duration::from_secs(5));
     }
@@ -238,13 +276,6 @@ fn stop_prefix(prefix: &Path, wine_dir: &Path) {
         .status();
 }
 
-fn kill_prefix(wine_dir: &Path, envs: &[(String, String)], report: &mut Report<'_>) -> Result<()> {
-    let mut cmd = Command::new(wine_dir.join("bin/wineserver"));
-    cmd.arg("-k");
-    let _ = run(report, cmd, envs, Duration::from_secs(30));
-    Ok(())
-}
-
 fn run(
     report: &mut Report<'_>,
     cmd: Command,
@@ -256,35 +287,6 @@ fn run(
         options = options.env(key.clone(), value.clone());
     }
     runner::run(cmd, options, |stream, line| report.line(stream, line))
-}
-
-fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    vec![
-        ("WINEPREFIX".into(), prefix.display().to_string()),
-        ("WINEDEBUG".into(), "-all".into()),
-        ("WINESERVER_TIMEOUT".into(), "60".into()),
-        (
-            "WINEDLLOVERRIDES".into(),
-            "winemenubuilder.exe=d;winegstreamer=".into(),
-        ),
-        (
-            "WINEDLLPATH".into(),
-            wine_dir.join("lib/wine").display().to_string(),
-        ),
-        (
-            "PATH".into(),
-            format!("{}:{path}", wine_dir.join("bin").display()),
-        ),
-        (
-            "WINE".into(),
-            wine_dir.join("bin/wine").display().to_string(),
-        ),
-        (
-            "WINESERVER".into(),
-            wine_dir.join("bin/wineserver").display().to_string(),
-        ),
-    ]
 }
 
 fn shell_quote(text: &str) -> String {

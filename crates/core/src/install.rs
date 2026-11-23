@@ -5,6 +5,8 @@
 //! launcher. Each stage records its result in the prefix manifest.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Result, bail};
 
@@ -37,6 +39,8 @@ pub struct SetupOptions {
     /// Install missing host packages first.
     pub install_deps: bool,
     pub elevation: Elevation,
+    /// Optional distro override from Config, mainly for dry-run testing.
+    pub distro_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -246,8 +250,15 @@ where
             components::ensure_fonts(&opts.prefix, opts.dry_run, CHILD_LOG, |stream, line| {
                 report.line(stream, line)
             })?;
-        outcome.fonts = fonts;
-        mark(&opts.prefix, STEP_FONTS, status(fonts), None, opts.dry_run);
+        outcome.fonts = fonts.fonts;
+        outcome.failures.extend(fonts.failures.iter().cloned());
+        mark(
+            &opts.prefix,
+            STEP_FONTS,
+            status(fonts.fonts),
+            None,
+            opts.dry_run,
+        );
     } else {
         mark(
             &opts.prefix,
@@ -295,13 +306,15 @@ fn finish_install(
 ) -> Result<()> {
     // The runtime usually comes from Image-Line's installer, but it is
     // optional there and sometimes skipped. Install it when it is missing.
+    let mut installed_webview = false;
     if !crate::components::webview2_installed(&opts.prefix) {
-        let _ =
+        installed_webview =
             components::install_webview2(&opts.prefix, opts.dry_run, CHILD_LOG, |stream, line| {
                 report.line(stream, line)
-            });
+            })
+            .unwrap_or(false);
     }
-    outcome.webview2 = crate::components::webview2_installed(&opts.prefix);
+    outcome.webview2 = opts.dry_run || crate::components::webview2_installed(&opts.prefix);
     mark(
         &opts.prefix,
         STEP_WEBVIEW2,
@@ -315,7 +328,7 @@ fn finish_install(
             .failures
             .push("WebView2 runtime not found".to_string());
     }
-    if apply_webview {
+    if apply_webview || installed_webview {
         wine::configure_webview2_prefix(&opts.prefix, opts.dry_run, CHILD_LOG, |stream, line| {
             report.line(stream, line)
         })?;
@@ -475,7 +488,7 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
         return Ok(true);
     }
 
-    let os = match OsRelease::detect() {
+    let os = match OsRelease::detect_with_override(opts.distro_override.as_deref()) {
         Ok(os) => os,
         Err(error) => {
             report.warn(format!("could not detect the distribution: {error:#}"));
@@ -555,13 +568,31 @@ pub fn prefetch<F>(log_path: Option<PathBuf>, with_installer: bool, on_line: F)
 where
     F: FnMut(Stream, &str),
 {
+    prefetch_cancellable(log_path, with_installer, None, on_line);
+}
+
+/// Like `prefetch`, but stops promptly when `cancel` is set.
+pub fn prefetch_cancellable<F>(
+    log_path: Option<PathBuf>,
+    with_installer: bool,
+    cancel: Option<Arc<AtomicBool>>,
+    on_line: F,
+) where
+    F: FnMut(Stream, &str),
+{
     if !with_installer {
+        return;
+    }
+    if deps::which("curl").is_none() && deps::which("wget").is_none() {
         return;
     }
     let mut sink = on_line;
     let mut report = Report::new(log_path, &mut sink);
     report.info("downloading the FL Studio installer in the background");
-    if let Err(error) = installer::fetch_installer(&mut report) {
+    if let Err(error) = installer::fetch_installer(&mut report, cancel.clone()) {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return;
+        }
         report.warn(format!("background download failed: {error:#}"));
     }
 }
@@ -610,6 +641,7 @@ mod tests {
             log_path: None,
             install_deps: false,
             elevation: Elevation::None,
+            distro_override: None,
         }
     }
 

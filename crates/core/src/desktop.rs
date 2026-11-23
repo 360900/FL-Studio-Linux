@@ -1,6 +1,7 @@
 //! Application menu entry, FLP association and `flstudio://` handler.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::deps::which;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
-use crate::{LAUNCHER_NAME, WINE_DIR_NAME, app_exe, to_windows_path};
+use crate::{LAUNCHER_NAME, WINE_DIR_NAME, app_exe, to_windows_path, wine};
 
 pub const DESKTOP_FILE: &str = "fl-studio.desktop";
 pub const URL_HANDLER_FILE: &str = "fl-studio-url.desktop";
@@ -73,13 +74,11 @@ where
         fs::create_dir_all(mime.parent().context("mime directory")?)?;
         fs::write(&mime, mime_xml()).with_context(|| format!("writing {}", mime.display()))?;
 
-        let shortcut = home_dir()?.join("Desktop").join("FL Studio.desktop");
-        if shortcut
-            .parent()
-            .map(|parent| parent.is_dir())
-            .unwrap_or(false)
-        {
-            let _ = fs::copy(&desktop, &shortcut);
+        if let Some(desktop_folder) = desktop_dir().filter(|dir| dir.is_dir()) {
+            let shortcut = desktop_folder.join("FL Studio.desktop");
+            if fs::copy(&desktop, &shortcut).is_ok() {
+                let _ = fs::set_permissions(&shortcut, fs::Permissions::from_mode(0o755));
+            }
         }
     }
 
@@ -103,6 +102,7 @@ where
 }
 
 fn desktop_contents(prefix: &Path, exec: &str) -> String {
+    let path_value = escape_desktop_string(&prefix.display().to_string());
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -110,14 +110,13 @@ fn desktop_contents(prefix: &Path, exec: &str) -> String {
          GenericName=Digital Audio Workstation\n\
          Comment=Windows FL Studio running through Wine\n\
          Icon=fl-studio\n\
-         Path={}\n\
+         Path={path_value}\n\
          Exec={exec} %F\n\
          Terminal=false\n\
          Categories=AudioVideo;Audio;Midi;\n\
          MimeType=application/x-flp;\n\
          StartupNotify=true\n\
-         StartupWMClass=fl64.exe\n",
-        prefix.display()
+         StartupWMClass=fl64.exe\n"
     )
 }
 
@@ -174,16 +173,20 @@ fn launcher() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let current = current?;
-    let cli = current.with_file_name(LAUNCHER_NAME);
-    if cli.is_file() {
-        return Some(cli);
+    if let Some(current) = current {
+        let cli = current.with_file_name(LAUNCHER_NAME);
+        if cli.is_file() {
+            return Some(cli);
+        }
+        if current
+            .file_name()
+            .map(|name| name == LAUNCHER_NAME)
+            .unwrap_or(false)
+        {
+            return Some(current);
+        }
     }
-    current
-        .file_name()
-        .map(|name| name == LAUNCHER_NAME)
-        .unwrap_or(false)
-        .then_some(current)
+    which(LAUNCHER_NAME)
 }
 
 fn launcher_exec(cli: &Path, prefix: &Path) -> String {
@@ -230,28 +233,39 @@ fn register_protocol(opts: &DesktopOptions, report: &mut Report<'_>) -> Result<b
         ),
     ];
 
+    let wine_dir = opts.prefix.join(WINE_DIR_NAME);
+    let wine_bin = wine_dir.join("bin/wine");
     report.info("flstudio:// and .flp handlers in the Wine prefix");
     for (key, name, value) in entries {
-        let mut cmd = Command::new(opts.prefix.join(WINE_DIR_NAME).join("bin/wine"));
-        cmd.args(["reg", "add", key, "/v", name, "/d", value, "/f"]);
+        let mut cmd = Command::new(&wine_bin);
+        cmd.args(["reg", "add", key]);
+        if name.is_empty() {
+            cmd.arg("/ve");
+        } else {
+            cmd.args(["/v", name]);
+        }
+        cmd.args(["/d", value, "/f"]);
         if opts.dry_run {
+            let value_flag = if name.is_empty() {
+                "/ve".to_string()
+            } else {
+                format!("/v '{name}'")
+            };
             report.info(format!(
-                "    WINEPREFIX={} {} reg add {} /v '{}' /d '{}' /f",
+                "    WINEPREFIX={} {} reg add {} {value_flag} /d '{}' /f",
                 opts.prefix.display(),
-                opts.prefix.join(WINE_DIR_NAME).join("bin/wine").display(),
+                wine_bin.display(),
                 key,
-                name,
                 value
             ));
             continue;
         }
-        if !opts.prefix.join(WINE_DIR_NAME).join("bin/wine").is_file() {
+        if !wine_bin.is_file() {
             report.warn("skipping Wine handlers: Wine is not installed");
             return Ok(false);
         }
         let mut options = RunOptions::default().stall(Duration::from_secs(120));
-        options = options.env("WINEPREFIX", opts.prefix.display().to_string());
-        options = options.env("WINEDEBUG", "-all");
+        options.envs = wine::wine_env(&opts.prefix, &wine_dir, "-all");
         let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
         if !result.success() {
             report.warn(format!("could not register {key}; continuing"));
@@ -268,15 +282,30 @@ fn register_protocol(opts: &DesktopOptions, report: &mut Report<'_>) -> Result<b
             report.warn("xdg-mime is missing; the desktop handlers are not registered");
             return Ok(false);
         }
+        let mut all_ok = true;
         for (file, scheme) in defaults {
             let mut cmd = Command::new("xdg-mime");
             cmd.args(["default", file, scheme]);
-            let _ = runner::run(
+            match runner::run(
                 cmd,
                 RunOptions::default().stall(Duration::from_secs(60)).quiet(),
                 |stream, line| report.line(stream, line),
-            );
+            ) {
+                Ok(result) if result.success() => {}
+                Ok(result) => {
+                    all_ok = false;
+                    report.warn(format!(
+                        "xdg-mime default {file} {scheme} failed ({})",
+                        result.status
+                    ));
+                }
+                Err(error) => {
+                    all_ok = false;
+                    report.warn(format!("xdg-mime default {file} {scheme} failed: {error}"));
+                }
+            }
         }
+        return Ok(all_ok);
     } else {
         for (file, scheme) in [
             (DESKTOP_FILE, "application/x-flp"),
@@ -384,21 +413,99 @@ fn xdg_data_home() -> Result<PathBuf> {
     }
 }
 
+/// Resolve the user's desktop directory via XDG user-dirs, falling back to `~/Desktop`.
+pub(crate) fn desktop_dir() -> Option<PathBuf> {
+    if which("xdg-user-dir").is_some()
+        && let Ok(output) = Command::new("xdg-user-dir").arg("DESKTOP").output()
+        && output.status.success()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            let path = PathBuf::from(&value);
+            if home_dir().ok().as_deref() != Some(path.as_path()) {
+                return Some(path);
+            }
+        }
+    }
+    let home = home_dir().ok()?;
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    if let Ok(text) = fs::read_to_string(config_home.join("user-dirs.dirs"))
+        && let Some(dir) = parse_user_dir(&text, "XDG_DESKTOP_DIR", &home)
+    {
+        return Some(dir);
+    }
+    Some(home.join("Desktop"))
+}
+
+fn parse_user_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(raw) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = raw.trim().trim_matches('"');
+        if value.is_empty() {
+            return None;
+        }
+        let path = if let Some(rest) = value.strip_prefix("$HOME/") {
+            home.join(rest)
+        } else if value == "$HOME" {
+            return None;
+        } else {
+            PathBuf::from(value)
+        };
+        return Some(path);
+    }
+    None
+}
+
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
 }
 
+/// Escape a `.desktop` string value (general string escaping).
+fn escape_desktop_string(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Quote a single argument for a `.desktop` `Exec=` line per the Freedesktop
+/// Desktop Entry Specification.
 fn quote(text: &str) -> String {
-    if text
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+".contains(c))
+    let escaped_percent = text.replace('%', "%%");
+    if !escaped_percent.is_empty()
+        && escaped_percent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+%".contains(c))
     {
-        text.to_string()
-    } else {
-        format!("\"{}\"", text.replace('"', "\\\""))
+        return escaped_percent;
     }
+    let mut out = String::with_capacity(escaped_percent.len() + 2);
+    out.push('"');
+    for ch in escaped_percent.chars() {
+        match ch {
+            // Desktop string unescaping runs before Exec quoting, so backslashes
+            // and Exec-reserved characters are escaped twice.
+            '\\' => out.push_str("\\\\\\\\"),
+            '"' => out.push_str("\\\\\""),
+            '`' => out.push_str("\\\\`"),
+            '$' => out.push_str("\\\\$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -431,6 +538,25 @@ mod tests {
     }
 
     #[test]
+    fn quote_escapes_desktop_exec_characters() {
+        assert_eq!(quote("/home/me/100%"), "/home/me/100%%");
+        assert_eq!(
+            quote("/home/me/My $Dir \"a\"\\b"),
+            "\"/home/me/My \\\\$Dir \\\\\"a\\\\\"\\\\\\\\b\""
+        );
+    }
+
+    #[test]
+    fn parses_localized_desktop_dir() {
+        let home = Path::new("/home/me");
+        let text = "# comment\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\n";
+        assert_eq!(
+            parse_user_dir(text, "XDG_DESKTOP_DIR", home),
+            Some(PathBuf::from("/home/me/Schreibtisch"))
+        );
+    }
+
+    #[test]
     fn wine_fallback_uses_the_newest_executable() {
         let dir = tempfile::tempdir().unwrap();
         let app = crate::app_dir(dir.path()).join("FL Studio 2026");
@@ -454,6 +580,7 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Exec="));
         assert!(text.contains("flstudio"));
+        assert!(text.contains("/ve"));
         assert!(text.contains("xdg-mime default"));
         assert!(!dir.path().join("FL Studio.desktop").exists());
     }

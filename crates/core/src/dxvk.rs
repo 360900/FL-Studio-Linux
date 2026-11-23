@@ -1,7 +1,7 @@
-//! Optional DXVK installation.
+//! DXVK installation and removal.
 //!
-//! DXVK speeds up Direct3D plugins, but it replaces the DLLs WebView2 renders
-//! through, so it stays off unless the user asks for it.
+//! DXVK is enabled by default to map Direct3D calls from FL Studio and plugins
+//! to Vulkan. It can be removed with `repair --dxvk false`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::WINE_DIR_NAME;
 use crate::config;
 use crate::http;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
-use crate::{WINE_DIR_NAME, deps};
+use crate::wine;
 
 pub const DXVK_REPO: &str = "doitsujin/dxvk";
 pub const DXVK_FALLBACK_VERSION: &str = "3.1.1";
@@ -86,7 +87,11 @@ where
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     if !root.join("x64/d3d9.dll").is_file() {
         let mut cmd = Command::new("tar");
-        cmd.arg("-xzf").arg(&archive).arg("-C").arg(&cache);
+        cmd.arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&cache)
+            .arg("--no-same-owner");
         let result = runner::run(
             cmd,
             RunOptions::default().stall(Duration::from_secs(300)),
@@ -97,7 +102,7 @@ where
         }
     }
 
-    kill_prefix(prefix, &wine_dir, &mut report);
+    wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
     let system32 = prefix.join("drive_c/windows/system32");
     let syswow64 = prefix.join("drive_c/windows/syswow64");
     fs::create_dir_all(&system32)?;
@@ -149,10 +154,15 @@ where
     if dry_run {
         report.info("    remove the DXVK DLLs from system32 and syswow64");
         report.info("    delete their DllOverrides entries");
+        report.info(format!(
+            "    WINEPREFIX={} {}/bin/wineboot -u",
+            prefix.display(),
+            wine_dir.display()
+        ));
         return Ok(());
     }
 
-    kill_prefix(prefix, &wine_dir, &mut report);
+    wine::kill_prefix(prefix, Some(&wine_dir), &mut report);
     for dll in DXVK_DLLS {
         let _ = fs::remove_file(prefix.join("drive_c/windows/system32").join(dll));
         let _ = fs::remove_file(prefix.join("drive_c/windows/syswow64").join(dll));
@@ -167,6 +177,8 @@ where
         ]);
         run_quiet(&mut report, cmd, prefix, &wine_dir);
     }
+    // Restore Wine's builtin DLL placeholders in system32 and syswow64.
+    wine::run_wineboot_update(prefix, &wine_dir, &mut report);
     let _ = fs::remove_file(config::prefix_state_path(prefix, ".dxvk_version"));
     report.info("DXVK removed");
     Ok(())
@@ -187,9 +199,7 @@ fn set_override(prefix: &Path, wine: &Path, wine_dir: &Path, name: &str, report:
         "/f",
     ]);
     let mut options = RunOptions::default().stall(Duration::from_secs(60));
-    for (key, value) in wine_env(prefix, wine_dir) {
-        options = options.env(key, value);
-    }
+    options.envs = wine::wine_env(prefix, wine_dir, "-all,fixme-all");
     match runner::run(cmd, options, |stream, line| report.line(stream, line)) {
         Ok(result) if result.success() => {}
         Ok(result) => report.warn(format!(
@@ -202,9 +212,7 @@ fn set_override(prefix: &Path, wine: &Path, wine_dir: &Path, name: &str, report:
 
 fn run_quiet(report: &mut Report<'_>, cmd: Command, prefix: &Path, wine_dir: &Path) {
     let mut options = RunOptions::default().stall(Duration::from_secs(60)).quiet();
-    for (key, value) in wine_env(prefix, wine_dir) {
-        options = options.env(key, value);
-    }
+    options.envs = wine::wine_env(prefix, wine_dir, "-all,fixme-all");
     let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
 }
 
@@ -214,38 +222,6 @@ fn latest_version() -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let tag = value.get("tag_name")?.as_str()?;
     Some(tag.trim().trim_start_matches('v').to_string())
-}
-
-fn kill_prefix(prefix: &Path, wine_dir: &Path, report: &mut Report<'_>) {
-    let wineserver = wine_dir.join("bin/wineserver");
-    let mut cmd = if wineserver.is_file() {
-        Command::new(wineserver)
-    } else if let Some(path) = deps::which("wineserver") {
-        Command::new(path)
-    } else {
-        return;
-    };
-    cmd.arg("-k");
-    let mut options = RunOptions::default().stall(Duration::from_secs(30)).quiet();
-    options = options.env("WINEPREFIX", prefix.display().to_string());
-    let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
-}
-
-fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    vec![
-        ("WINEPREFIX".into(), prefix.display().to_string()),
-        ("WINEDEBUG".into(), "-all,fixme-all".into()),
-        ("WINESERVER_TIMEOUT".into(), "60".into()),
-        (
-            "WINEDLLPATH".into(),
-            wine_dir.join("lib/wine").display().to_string(),
-        ),
-        (
-            "PATH".into(),
-            format!("{}:{path}", wine_dir.join("bin").display()),
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -271,6 +247,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         remove(dir.path(), false, None, |_, _| {}).unwrap();
         assert!(!dir.path().join(".cache").exists());
+    }
+
+    #[test]
+    fn remove_dry_run_restores_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        config::write_prefix_state(dir.path(), ".dxvk_version", "3.1.1").unwrap();
+        let mut lines = Vec::new();
+        remove(dir.path(), true, None, |_, line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
+        assert!(lines.join("\n").contains("wineboot -u"));
     }
 
     #[test]

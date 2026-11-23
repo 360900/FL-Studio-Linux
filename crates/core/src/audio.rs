@@ -15,6 +15,7 @@ use crate::WINE_DIR_NAME;
 use crate::config;
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
+use crate::wine;
 
 const WINEPIPE_SO: &[u8] = include_bytes!("../../../vendor/winepipe/winepipe.so");
 const WINEPIPE_DLL64: &[u8] = include_bytes!("../../../vendor/winepipe/winepipe-x86_64.dll");
@@ -98,6 +99,7 @@ where
     let mut report = Report::new(log_path, &mut sink);
     if driver == AudioDriver::None {
         report.info("low-latency audio: off");
+        remove_winepipe(prefix, dry_run, &mut report);
         if !dry_run {
             let _ = fs::remove_file(config::prefix_state_path(prefix, ".audio_driver"));
         }
@@ -171,7 +173,7 @@ fn install_winepipe(
         return Ok(());
     }
 
-    kill_prefix(prefix, wine_dir, report)?;
+    wine::kill_prefix(prefix, Some(wine_dir), report);
     for (path, bytes) in &files {
         write_file(path, bytes)?;
     }
@@ -179,14 +181,50 @@ fn install_winepipe(
         write_file(&syswow64.join("winepipe.dll"), WINEPIPE_DLL32)?;
     }
 
-    regsvr(prefix, wine_dir, "winepipe.dll", false, report)?;
+    regsvr(prefix, wine_dir, "winepipe.dll", false, false, report)?;
     if syswow64.is_dir()
-        && let Err(error) = regsvr(prefix, wine_dir, "winepipe.dll", true, report)
+        && let Err(error) = regsvr(prefix, wine_dir, "winepipe.dll", true, false, report)
     {
         report.warn(format!("32-bit WinePipe registration failed: {error}"));
     }
     report.info("WinePipe registered");
     Ok(())
+}
+
+fn remove_winepipe(prefix: &Path, dry_run: bool, report: &mut Report<'_>) {
+    let wine_dir = prefix.join(WINE_DIR_NAME);
+    let lib = wine_dir.join("lib/wine");
+    let system32 = prefix.join("drive_c/windows/system32");
+    let syswow64 = prefix.join("drive_c/windows/syswow64");
+    let files = [
+        lib.join("x86_64-unix/winepipe.so"),
+        lib.join("x86_64-windows/winepipe.dll"),
+        lib.join("i386-windows/winepipe.dll"),
+        system32.join("winepipe.dll"),
+        syswow64.join("winepipe.dll"),
+    ];
+    let has_files = files.iter().any(|path| path.is_file());
+    let has_marker = config::read_prefix_state(prefix, ".audio_driver").is_some();
+    if !has_files && !has_marker {
+        return;
+    }
+
+    if dry_run {
+        report.info("    unregister and remove WinePipe from the Wine prefix");
+        return;
+    }
+
+    if wine_dir.join("bin/wine").is_file() {
+        wine::kill_prefix(prefix, Some(&wine_dir), report);
+        let _ = regsvr(prefix, &wine_dir, "winepipe.dll", false, true, report);
+        if syswow64.is_dir() {
+            let _ = regsvr(prefix, &wine_dir, "winepipe.dll", true, true, report);
+        }
+    }
+    for path in &files {
+        let _ = fs::remove_file(path);
+    }
+    report.info("WinePipe removed");
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -201,59 +239,30 @@ fn regsvr(
     wine_dir: &Path,
     dll: &str,
     wow64: bool,
+    unregister: bool,
     report: &mut Report<'_>,
 ) -> Result<()> {
     let mut cmd = Command::new(wine_dir.join("bin/wine"));
     if wow64 {
-        cmd.arg("C:\\windows\\syswow64\\regsvr32.exe")
-            .arg("/s")
-            .arg(dll);
+        cmd.arg("C:\\windows\\syswow64\\regsvr32.exe");
     } else {
-        cmd.arg("regsvr32").arg("/s").arg(dll);
+        cmd.arg("regsvr32");
     }
+    if unregister {
+        cmd.arg("/u");
+    }
+    cmd.arg("/s").arg(dll);
     run_regsvr(prefix, wine_dir, cmd, report)
 }
 
 fn run_regsvr(prefix: &Path, wine_dir: &Path, cmd: Command, report: &mut Report<'_>) -> Result<()> {
     let mut options = RunOptions::default().stall(Duration::from_secs(120));
-    for (key, value) in wine_env(prefix, wine_dir) {
-        options = options.env(key, value);
-    }
+    options.envs = wine::wine_env(prefix, wine_dir, "-all");
     let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
     if !result.success() {
         bail!("regsvr32 failed: {}", result.tail_text(10));
     }
     Ok(())
-}
-
-fn kill_prefix(prefix: &Path, wine_dir: &Path, report: &mut Report<'_>) -> Result<()> {
-    let wineserver = wine_dir.join("bin/wineserver");
-    if !wineserver.is_file() {
-        return Ok(());
-    }
-    let mut cmd = Command::new(wineserver);
-    cmd.arg("-k");
-    let mut options = RunOptions::default().stall(Duration::from_secs(30)).quiet();
-    options = options.env("WINEPREFIX", prefix.display().to_string());
-    let _ = runner::run(cmd, options, |stream, line| report.line(stream, line));
-    Ok(())
-}
-
-fn wine_env(prefix: &Path, wine_dir: &Path) -> Vec<(String, String)> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    vec![
-        ("WINEPREFIX".into(), prefix.display().to_string()),
-        ("WINEDEBUG".into(), "-all".into()),
-        ("WINESERVER_TIMEOUT".into(), "60".into()),
-        (
-            "WINEDLLPATH".into(),
-            wine_dir.join("lib/wine").display().to_string(),
-        ),
-        (
-            "PATH".into(),
-            format!("{}:{path}", wine_dir.join("bin").display()),
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -288,6 +297,21 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("winepipe.so"));
         assert!(text.contains("regsvr32"));
+        assert!(!prefix.join(".audio_driver").exists());
+    }
+
+    #[test]
+    fn none_removes_existing_winepipe_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path();
+        let dll = prefix.join("drive_c/windows/system32/winepipe.dll");
+        fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        fs::write(&dll, b"dll").unwrap();
+        config::write_prefix_state(prefix, ".audio_driver", "winepipe").unwrap();
+
+        let report = install(prefix, AudioDriver::None, false, None, |_, _| {}).unwrap();
+        assert!(!report.installed);
+        assert!(!dll.exists());
         assert!(!prefix.join(".audio_driver").exists());
     }
 }

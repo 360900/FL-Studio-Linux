@@ -1,12 +1,14 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use fl_studio_linux_core::audio::AudioDriver;
-use fl_studio_linux_core::config::{Config, default_prefix, expand_home};
+use fl_studio_linux_core::config::{Config, default_prefix, expand_home, validate_prefix};
 use fl_studio_linux_core::deps;
 use fl_studio_linux_core::distro::OsRelease;
 use fl_studio_linux_core::doctor::{self, DoctorReport};
@@ -151,10 +153,10 @@ enum Command {
         #[arg(long)]
         prefix: Option<PathBuf>,
         /// Project files or flstudio:// links to open
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Remove the prefix, desktop entries and stored config
+    /// Remove the prefix and desktop entries, and reset the stored prefix
     Uninstall {
         /// Do not ask for confirmation
         #[arg(long)]
@@ -162,6 +164,9 @@ enum Command {
         /// Print what would be removed without deleting anything
         #[arg(long)]
         dry_run: bool,
+        /// Prefix override
+        #[arg(long)]
+        prefix: Option<PathBuf>,
     },
 }
 
@@ -224,7 +229,11 @@ fn main() -> Result<()> {
             prefix,
             args,
         } => run_launch(&cfg, dry_run, prefix, args),
-        Command::Uninstall { yes, dry_run } => run_uninstall(&cfg, yes, dry_run),
+        Command::Uninstall {
+            yes,
+            dry_run,
+            prefix,
+        } => run_uninstall(&cfg, yes, dry_run, prefix),
     }
 }
 
@@ -341,6 +350,7 @@ fn run_wine_setup(
     }
 
     let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
     println!("wine setup for {}", prefix.display());
     println!(
         "  profile {}",
@@ -440,8 +450,9 @@ fn run_install(
     audio: Option<String>,
     dpi: Option<u32>,
 ) -> Result<()> {
-    let os = OsRelease::detect()?;
+    let os = OsRelease::detect_with_override(cfg.distro_override.as_deref())?;
     let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
     let installer = installer.map(|path| expand_home(&path));
     let (dxvk, fonts, audio) = resolve_options(cfg, dxvk, fonts, audio);
 
@@ -485,6 +496,7 @@ fn run_install(
         log_path: None,
         install_deps: !skip_deps,
         elevation: packages::default_elevation(),
+        distro_override: cfg.distro_override.clone(),
     };
 
     if dry_run {
@@ -503,15 +515,25 @@ fn run_install(
     let log_path = log_dir.join(format!("install-{}.log", now_epoch()));
     println!("  log       {}", log_path.display());
 
+    let cancel_prefetch = Arc::new(AtomicBool::new(false));
     let prefetch = {
         let log_path = log_path.clone();
         let with_installer = options.installer.is_none();
-        std::thread::spawn(move || install::prefetch(Some(log_path), with_installer, print_stream))
+        let cancel = cancel_prefetch.clone();
+        std::thread::spawn(move || {
+            install::prefetch_cancellable(
+                Some(log_path),
+                with_installer,
+                Some(cancel),
+                print_stream,
+            )
+        })
     };
 
     let mut options = options;
     options.log_path = Some(log_path);
     let outcome = install::install(&options, print_stream);
+    cancel_prefetch.store(true, Ordering::Relaxed);
     let _ = prefetch.join();
     let outcome = outcome?;
     print_outcome(&outcome);
@@ -566,6 +588,8 @@ fn run_update(
     dpi: Option<u32>,
 ) -> Result<()> {
     let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
+    install::ensure_installed(&prefix)?;
     let installer = installer.map(|path| expand_home(&path));
     println!("update FL Studio");
     println!("  prefix    {}", prefix.display());
@@ -597,6 +621,7 @@ fn run_update(
         log_path,
         install_deps: false,
         elevation: packages::default_elevation(),
+        distro_override: cfg.distro_override.clone(),
     };
     let outcome = install::update(&options, print_stream)?;
     print_outcome(&outcome);
@@ -621,6 +646,8 @@ fn run_repair(
     dpi: Option<u32>,
 ) -> Result<()> {
     let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
+    install::ensure_installed(&prefix)?;
     let (dxvk, fonts, audio) = resolve_options(cfg, dxvk, fonts, audio);
     println!("repair FL Studio");
     println!("  prefix    {}", prefix.display());
@@ -652,6 +679,7 @@ fn run_repair(
         log_path,
         install_deps: false,
         elevation: packages::default_elevation(),
+        distro_override: cfg.distro_override.clone(),
     };
     let outcome = install::repair(&options, print_stream)?;
     print_outcome(&outcome);
@@ -674,12 +702,16 @@ fn run_launch(
     args: Vec<String>,
 ) -> Result<()> {
     let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
+    install::ensure_installed(&prefix)?;
     let log_path = if dry_run {
         None
     } else {
         let log_dir = prefix.join("logs");
         fs::create_dir_all(&log_dir)?;
-        Some(log_dir.join(format!("launch-{}.log", now_epoch())))
+        let path = log_dir.join("launch.log");
+        let _ = fs::write(&path, b"");
+        Some(path)
     };
     let options = launch::LaunchOptions {
         prefix,
@@ -692,8 +724,9 @@ fn run_launch(
     Ok(())
 }
 
-fn run_uninstall(cfg: &Config, yes: bool, dry_run: bool) -> Result<()> {
-    let prefix = cfg.prefix.clone();
+fn run_uninstall(cfg: &Config, yes: bool, dry_run: bool, prefix: Option<PathBuf>) -> Result<()> {
+    let prefix = resolve_prefix(prefix, cfg);
+    validate_prefix(&prefix)?;
     if !dry_run
         && !yes
         && !confirm(&format!(
@@ -720,9 +753,12 @@ fn run_uninstall(cfg: &Config, yes: bool, dry_run: bool) -> Result<()> {
     if dry_run {
         return Ok(());
     }
-    let mut saved = cfg.clone();
-    saved.prefix = default_prefix();
-    saved.save()?;
+    if prefix == cfg.prefix {
+        let mut saved = cfg.clone();
+        saved.prefix = default_prefix();
+        saved.save()?;
+        println!("install location reset to {}", saved.prefix.display());
+    }
     println!(
         "removed {} desktop entr{}, prefix removed={}",
         outcome.removed_entries,
@@ -736,8 +772,19 @@ fn run_uninstall(cfg: &Config, yes: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn format_missing_deps(missing: &[&deps::DepCheck], has_download: bool) -> String {
+    let names: Vec<&str> = missing.iter().map(|dep| dep.command).collect();
+    if names.is_empty() && !has_download {
+        "curl or wget".to_string()
+    } else if !has_download {
+        format!("{} and curl or wget", names.join(", "))
+    } else {
+        names.join(", ")
+    }
+}
+
 fn run_deps(cfg: &Config, dry_run: bool, yes: bool, pkexec: bool) -> Result<()> {
-    let os = OsRelease::detect()?;
+    let os = OsRelease::detect_with_override(cfg.distro_override.as_deref())?;
     let plan = packages::plan(&os);
 
     println!(
@@ -754,17 +801,14 @@ fn run_deps(cfg: &Config, dry_run: bool, yes: bool, pkexec: bool) -> Result<()> 
     if plan.steps.is_empty() {
         let checks = deps::check_all();
         let missing = deps::missing(&checks);
-        if missing.is_empty() && deps::has_download_tool(&checks) {
+        let has_download = deps::has_download_tool(&checks);
+        if missing.is_empty() && has_download {
             println!("all required dependencies are present");
             return Ok(());
         }
         bail!(
             "no automatic plan for this distribution; still missing: {}",
-            missing
-                .iter()
-                .map(|dep| dep.command)
-                .collect::<Vec<_>>()
-                .join(", ")
+            format_missing_deps(&missing, has_download)
         );
     }
 
@@ -805,6 +849,7 @@ fn run_deps(cfg: &Config, dry_run: bool, yes: bool, pkexec: bool) -> Result<()> 
         _ => {}
     }
 
+    validate_prefix(&cfg.prefix)?;
     let log_dir = cfg.prefix.join("logs");
     fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join(format!("deps-{}.log", now_epoch()));
@@ -826,17 +871,14 @@ fn run_deps(cfg: &Config, dry_run: bool, yes: bool, pkexec: bool) -> Result<()> 
 
     let checks = deps::check_all();
     let missing = deps::missing(&checks);
-    if missing.is_empty() && deps::has_download_tool(&checks) {
+    let has_download = deps::has_download_tool(&checks);
+    if missing.is_empty() && has_download {
         println!("all required dependencies are present");
         Ok(())
     } else {
         bail!(
             "still missing: {}",
-            missing
-                .iter()
-                .map(|dep| dep.command)
-                .collect::<Vec<_>>()
-                .join(", ")
+            format_missing_deps(&missing, has_download)
         )
     }
 }

@@ -7,7 +7,7 @@
 //! sudo or pkexec.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ pub struct PackagePlan {
 }
 
 pub fn plan(os: &OsRelease) -> PackagePlan {
-    plan_with_multilib(os, None)
+    plan_with(os, None, None)
 }
 
 fn arch_multilib_enabled() -> bool {
@@ -60,7 +60,11 @@ fn arch_multilib_enabled() -> bool {
         .unwrap_or(true)
 }
 
-fn plan_with_multilib(os: &OsRelease, multilib: Option<bool>) -> PackagePlan {
+fn is_ostree_host() -> bool {
+    Path::new("/run/ostree-booted").exists()
+}
+
+fn plan_with(os: &OsRelease, multilib: Option<bool>, ostree: Option<bool>) -> PackagePlan {
     let family = os.family();
     let id = os.id.to_ascii_lowercase();
     let mut notes = Vec::new();
@@ -71,11 +75,11 @@ fn plan_with_multilib(os: &OsRelease, multilib: Option<bool>) -> PackagePlan {
                 .to_string(),
         );
     }
-    if id.contains("bazzite") {
-        notes.push(
-            "Bazzite is an immutable distribution; automatic dependency installation is disabled."
-                .to_string(),
-        );
+    if id.contains("bazzite") || ostree.unwrap_or_else(is_ostree_host) {
+        notes.push(format!(
+            "{} is an immutable distribution; automatic dependency installation is disabled.",
+            os.name()
+        ));
         return PackagePlan {
             family,
             flavor: id,
@@ -141,25 +145,35 @@ fn pacman_install(op: &str, packages: &str) -> String {
 
 fn ubuntu_plan(os: &OsRelease) -> (String, Vec<PackageStep>) {
     let (major, minor) = version_tuple(os);
-    let archive = if (major, minor) >= (26, 4) {
-        "7zip"
+    let (flavor, install_script) = if os.id == "ubuntu" {
+        let archive = if (major, minor) >= (26, 4) {
+            "7zip"
+        } else {
+            "p7zip-full"
+        };
+        (
+            format!("ubuntu-{major}.{minor}"),
+            format!(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 wine32:i386 winetricks cabextract wget curl {archive} tar xz-utils pciutils unzip icoutils"
+            ),
+        )
     } else {
-        "p7zip-full"
+        // Ubuntu derivatives carry their own VERSION_ID scheme, so detect
+        // whether the repo provides `7zip` or `p7zip-full` at install time.
+        (
+            os.id.clone(),
+            "archive=p7zip-full; apt-cache show 7zip >/dev/null 2>&1 && archive=7zip; DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 wine32:i386 winetricks cabextract wget curl \"$archive\" tar xz-utils pciutils unzip icoutils".to_string(),
+        )
     };
-    let mut steps = vec![
+    let steps = vec![
         PackageStep::root(
             "Enable the i386 architecture",
             "dpkg --add-architecture i386",
         ),
         PackageStep::root("Refresh package lists", "apt-get update"),
+        PackageStep::root("Install Wine libraries and installer tools", install_script),
     ];
-    steps.push(PackageStep::root(
-        "Install Wine libraries and installer tools",
-        format!(
-            "apt-get install -y wine wine64 wine32:i386 winetricks cabextract wget curl {archive} tar xz-utils pciutils unzip icoutils"
-        ),
-    ));
-    (format!("ubuntu-{major}.{minor}"), steps)
+    (flavor, steps)
 }
 
 fn fedora_plan() -> (String, Vec<PackageStep>) {
@@ -182,14 +196,14 @@ fn suse_plan() -> (String, Vec<PackageStep>) {
     (
         "opensuse".to_string(),
         vec![
-            PackageStep::root("Refresh package lists", "zypper refresh"),
+            PackageStep::root("Refresh package lists", "zypper --non-interactive refresh"),
             PackageStep::root(
                 "Install Wine libraries and installer tools",
-                "zypper install -y wine winetricks cabextract wget curl 7zip tar xz pciutils unzip icoutils",
+                "zypper --non-interactive install -y wine winetricks cabextract wget curl 7zip tar xz pciutils unzip icoutils",
             ),
             PackageStep::root_optional(
                 "Install the 32-bit Wine libraries",
-                "zypper install -y wine-32bit",
+                "zypper --non-interactive install -y wine-32bit",
             ),
         ],
     )
@@ -253,6 +267,8 @@ pub struct PlanOutcome {
     pub failed_optional: Vec<String>,
 }
 
+const OPT_FAIL_MARKER: &str = "__FL_STUDIO_OPT_FAIL__:";
+
 pub fn run_plan<F>(plan: &PackagePlan, opts: &PlanRunOptions, mut on_line: F) -> Result<PlanOutcome>
 where
     F: FnMut(Stream, &str),
@@ -264,6 +280,14 @@ where
             "no automatic package steps for this distribution",
         );
         return Ok(outcome);
+    }
+
+    // Batch root steps into a single pkexec invocation so polkit only prompts once.
+    if !opts.dry_run
+        && opts.elevation == Elevation::Pkexec
+        && plan.steps.iter().all(|step| step.needs_root)
+    {
+        return run_batched_pkexec(plan, opts, &mut on_line);
     }
 
     let total = plan.steps.len();
@@ -318,6 +342,73 @@ where
     Ok(outcome)
 }
 
+fn batched_pkexec_script(plan: &PackagePlan) -> String {
+    let total = plan.steps.len();
+    let mut parts = Vec::with_capacity(total * 2);
+    for (index, step) in plan.steps.iter().enumerate() {
+        let header = format!("==> [{}/{}] {}", index + 1, total, step.label);
+        parts.push(format!("printf '%s\\n' {}", shell_quote(&header)));
+        if step.optional {
+            let marker = format!("{OPT_FAIL_MARKER}{}", step.label);
+            parts.push(format!(
+                "({}) || printf '%s\\n' {} >&2",
+                step.script,
+                shell_quote(&marker)
+            ));
+        } else {
+            parts.push(format!("({}) || exit $?", step.script));
+        }
+    }
+    parts.join("\n")
+}
+
+fn run_batched_pkexec<F>(
+    plan: &PackagePlan,
+    opts: &PlanRunOptions,
+    on_line: &mut F,
+) -> Result<PlanOutcome>
+where
+    F: FnMut(Stream, &str),
+{
+    let script = batched_pkexec_script(plan);
+    let mut cmd = Command::new("pkexec");
+    cmd.arg("/bin/sh").arg("-c").arg(&script);
+    let mut run_opts = RunOptions::default()
+        .stall(Duration::from_secs(1800))
+        .log_append();
+    if let Some(path) = &opts.log_path {
+        run_opts = run_opts.log(path);
+    }
+
+    let mut failed_optional = Vec::new();
+    let result = runner::run(cmd, run_opts, |stream, line| {
+        if let Some(label) = line.strip_prefix(OPT_FAIL_MARKER) {
+            failed_optional.push(label.to_string());
+            on_line(
+                Stream::Stderr,
+                &format!("optional step failed, continuing: {label}"),
+            );
+        } else {
+            on_line(stream, line);
+        }
+    })?;
+
+    if !result.success() {
+        bail!("package installation failed\n{}", result.tail_text(15));
+    }
+
+    let completed = plan
+        .steps
+        .iter()
+        .filter(|step| !failed_optional.contains(&step.label))
+        .map(|step| step.label.clone())
+        .collect();
+    Ok(PlanOutcome {
+        completed,
+        failed_optional,
+    })
+}
+
 fn build_command(step: &PackageStep, elevation: Elevation) -> Result<Command> {
     if !step.needs_root || elevation == Elevation::None {
         let mut cmd = Command::new("sh");
@@ -350,7 +441,7 @@ mod tests {
     use super::*;
 
     fn plan_for(text: &str) -> PackagePlan {
-        plan_with_multilib(&OsRelease::parse(text), Some(true))
+        plan_with(&OsRelease::parse(text), Some(true), Some(false))
     }
 
     fn scripts(plan: &PackagePlan) -> String {
@@ -370,7 +461,7 @@ mod tests {
         assert!(scripts(&plan).contains("cabextract"));
         assert!(plan.notes.is_empty());
 
-        let plan = plan_with_multilib(&OsRelease::parse("ID=arch\n"), Some(false));
+        let plan = plan_with(&OsRelease::parse("ID=arch\n"), Some(false), Some(false));
         assert!(plan.steps[0].script.contains("[multilib]"));
     }
 
@@ -380,6 +471,7 @@ mod tests {
         assert_eq!(plan.flavor, "ubuntu-24.4");
         let scripts = scripts(&plan);
         assert!(scripts.contains("dpkg --add-architecture i386"));
+        assert!(scripts.contains("DEBIAN_FRONTEND=noninteractive"));
         assert!(scripts.contains("wine32:i386"));
         assert!(scripts.contains("p7zip-full"));
         assert!(scripts.contains("cabextract"));
@@ -394,6 +486,13 @@ mod tests {
     }
 
     #[test]
+    fn ubuntu_derivatives_probe_7zip() {
+        let plan = plan_for("ID=linuxmint\nVERSION_ID=\"22.1\"\nID_LIKE=\"ubuntu debian\"\n");
+        assert_eq!(plan.flavor, "linuxmint");
+        assert!(scripts(&plan).contains("apt-cache show 7zip"));
+    }
+
+    #[test]
     fn fedora_and_suse_plans() {
         let fedora = plan_for("ID=fedora\n");
         assert!(scripts(&fedora).contains("dnf install"));
@@ -401,7 +500,8 @@ mod tests {
         assert!(!fedora.steps[1].optional);
 
         let suse = plan_for("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
-        assert!(scripts(&suse).contains("zypper install"));
+        assert!(scripts(&suse).contains("zypper --non-interactive refresh"));
+        assert!(scripts(&suse).contains("zypper --non-interactive install"));
         assert!(scripts(&suse).contains("cabextract"));
     }
 
@@ -414,6 +514,29 @@ mod tests {
         let bazzite = plan_for("ID=bazzite\nID_LIKE=fedora\n");
         assert!(bazzite.steps.is_empty());
         assert!(bazzite.notes.iter().any(|note| note.contains("immutable")));
+
+        let silverblue = plan_with(
+            &OsRelease::parse("ID=fedora\nPRETTY_NAME=\"Fedora Silverblue\"\n"),
+            Some(true),
+            Some(true),
+        );
+        assert!(silverblue.steps.is_empty());
+        assert!(
+            silverblue
+                .notes
+                .iter()
+                .any(|note| note.contains("immutable"))
+        );
+    }
+
+    #[test]
+    fn batched_pkexec_combines_steps() {
+        let plan = plan_for("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
+        let script = batched_pkexec_script(&plan);
+        assert!(script.contains("==> [1/3]"));
+        assert!(script.contains("==> [3/3]"));
+        assert!(script.contains("|| exit $?"));
+        assert!(script.contains(OPT_FAIL_MARKER));
     }
 
     #[test]

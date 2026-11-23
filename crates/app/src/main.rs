@@ -5,10 +5,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
-use fl_studio_linux_core::config::{Config, default_prefix};
+use fl_studio_linux_core::config::{Config, default_prefix, validate_prefix};
 use fl_studio_linux_core::deps;
 use fl_studio_linux_core::doctor::{self, DoctorReport};
 use fl_studio_linux_core::gpu::{self, Vendor};
@@ -24,8 +26,12 @@ use slint::{ComponentHandle, LogicalSize, Model, VecModel};
 
 enum UiEvent {
     Doctor(Box<DoctorReport>),
-    Log(String, bool),
-    JobDone(&'static str),
+    Log {
+        text: String,
+        error: bool,
+        status: bool,
+    },
+    JobDone(&'static str, Vec<String>),
     JobFailed(&'static str, String),
 }
 
@@ -58,6 +64,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if ui.get_busy() {
+                return;
+            }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
             start_job(&ui, "Installing…");
@@ -72,6 +81,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if ui.get_busy() {
+                return;
+            }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             start_job(&ui, "Opening…");
             spawn_launch(cfg, tx.clone());
@@ -85,6 +97,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if ui.get_busy() {
+                return;
+            }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
             start_job(&ui, "Updating…");
@@ -99,6 +114,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if ui.get_busy() {
+                return;
+            }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
             start_job(&ui, "Repairing…");
@@ -113,6 +131,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if ui.get_busy() {
+                return;
+            }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             start_job(&ui, "Uninstalling…");
             spawn_uninstall(cfg, tx.clone());
@@ -157,23 +178,36 @@ fn main() -> Result<(), slint::PlatformError> {
                         keep_state = false;
                         fit_window(&ui);
                     }
-                    UiEvent::Log(text, error) => {
-                        if !error {
+                    UiEvent::Log {
+                        text,
+                        error,
+                        status,
+                    } => {
+                        if status && !error {
                             ui.set_status_text(text.clone().into());
                         }
                         push_log(&logs, text, error);
                     }
-                    UiEvent::JobDone(kind) => {
+                    UiEvent::JobDone(kind, failures) => {
                         ui.set_busy(false);
-                        ui.set_state_text(done_state(kind).into());
                         ui.set_status_text("".into());
                         match kind {
                             "install" => ui.set_installed(true),
                             "uninstall" => ui.set_installed(false),
                             _ => {}
                         }
-                        keep_state = kind != "install";
-                        push_log(&logs, format!("{kind}: finished"), false);
+                        if failures.is_empty() {
+                            ui.set_state_text(done_state(kind).into());
+                            keep_state = kind != "install";
+                            push_log(&logs, format!("{kind}: finished"), false);
+                        } else {
+                            let summary = format!("Completed with issues: {}", failures.join(", "));
+                            ui.set_state_text(warn_state(kind).into());
+                            ui.set_error_text(summary.clone().into());
+                            keep_state = true;
+                            push_log(&logs, summary, true);
+                            fit_window(&ui);
+                        }
                         spawn_doctor(Config::load().unwrap_or_default(), tx.clone());
                     }
                     UiEvent::JobFailed(kind, message) => {
@@ -253,6 +287,15 @@ fn done_state(kind: &str) -> &'static str {
         "launch" => "Started. It may take a moment to appear.",
         "uninstall" => "Uninstalled",
         _ => "Done",
+    }
+}
+
+fn warn_state(kind: &str) -> &'static str {
+    match kind {
+        "install" => "Installed with warnings",
+        "update" => "Updated with warnings",
+        "repair" => "Repaired with warnings",
+        _ => "Finished with warnings",
     }
 }
 
@@ -343,24 +386,34 @@ fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "install");
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            validate_prefix(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
             let mut send = |stream: Stream, line: &str| {
-                let _ = tx.send(UiEvent::Log(
-                    line.to_string(),
-                    matches!(stream, Stream::Stderr),
-                ));
+                let _ = tx.send(UiEvent::Log {
+                    text: line.to_string(),
+                    error: matches!(stream, Stream::Stderr),
+                    status: true,
+                });
             };
+            let cancel_prefetch = Arc::new(AtomicBool::new(false));
             let prefetch = {
                 let tx = tx.clone();
                 let log_path = log_path.clone();
+                let cancel = cancel_prefetch.clone();
                 std::thread::spawn(move || {
-                    install::prefetch(Some(log_path), true, |stream, line| {
-                        let _ = tx.send(UiEvent::Log(
-                            line.to_string(),
-                            matches!(stream, Stream::Stderr),
-                        ));
-                    });
+                    install::prefetch_cancellable(
+                        Some(log_path),
+                        true,
+                        Some(cancel),
+                        |stream, line| {
+                            let _ = tx.send(UiEvent::Log {
+                                text: line.to_string(),
+                                error: matches!(stream, Stream::Stderr),
+                                status: false,
+                            });
+                        },
+                    );
                 })
             };
             let dpi = display_dpi(display, &tx, &log_path);
@@ -376,18 +429,18 @@ fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
                     log_path: Some(log_path.clone()),
                     install_deps: true,
                     elevation: default_elevation(),
+                    distro_override: cfg.distro_override.clone(),
                 },
                 &mut send,
             );
-            if report.is_ok() {
-                let _ = prefetch.join();
-            }
-            let _ = report?;
-            Ok(())
+            cancel_prefetch.store(true, Ordering::Relaxed);
+            let _ = prefetch.join();
+            let report = report?;
+            Ok(report.failures)
         })();
         match result {
-            Ok(()) => {
-                let _ = tx.send(UiEvent::JobDone("install"));
+            Ok(failures) => {
+                let _ = tx.send(UiEvent::JobDone("install", failures));
             }
             Err(error) => job_failed(&tx, "install", &log_path, &error),
         }
@@ -398,24 +451,35 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "update");
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            validate_prefix(&prefix)?;
+            install::ensure_installed(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
             let mut send = |stream: Stream, line: &str| {
-                let _ = tx.send(UiEvent::Log(
-                    line.to_string(),
-                    matches!(stream, Stream::Stderr),
-                ));
+                let _ = tx.send(UiEvent::Log {
+                    text: line.to_string(),
+                    error: matches!(stream, Stream::Stderr),
+                    status: true,
+                });
             };
+            let cancel_prefetch = Arc::new(AtomicBool::new(false));
             let prefetch = {
                 let tx = tx.clone();
                 let log_path = log_path.clone();
+                let cancel = cancel_prefetch.clone();
                 std::thread::spawn(move || {
-                    install::prefetch(Some(log_path), true, |stream, line| {
-                        let _ = tx.send(UiEvent::Log(
-                            line.to_string(),
-                            matches!(stream, Stream::Stderr),
-                        ));
-                    });
+                    install::prefetch_cancellable(
+                        Some(log_path),
+                        true,
+                        Some(cancel),
+                        |stream, line| {
+                            let _ = tx.send(UiEvent::Log {
+                                text: line.to_string(),
+                                error: matches!(stream, Stream::Stderr),
+                                status: false,
+                            });
+                        },
+                    );
                 })
             };
             let dpi = display_dpi(display, &tx, &log_path);
@@ -431,18 +495,18 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
                     log_path: Some(log_path.clone()),
                     install_deps: false,
                     elevation: default_elevation(),
+                    distro_override: cfg.distro_override.clone(),
                 },
                 &mut send,
             );
-            if report.is_ok() {
-                let _ = prefetch.join();
-            }
-            let _ = report?;
-            Ok(())
+            cancel_prefetch.store(true, Ordering::Relaxed);
+            let _ = prefetch.join();
+            let report = report?;
+            Ok(report.failures)
         })();
         match result {
-            Ok(()) => {
-                let _ = tx.send(UiEvent::JobDone("update"));
+            Ok(failures) => {
+                let _ = tx.send(UiEvent::JobDone("update", failures));
             }
             Err(error) => job_failed(&tx, "update", &log_path, &error),
         }
@@ -453,16 +517,19 @@ fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "repair");
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            validate_prefix(&prefix)?;
+            install::ensure_installed(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
             let mut send = |stream: Stream, line: &str| {
-                let _ = tx.send(UiEvent::Log(
-                    line.to_string(),
-                    matches!(stream, Stream::Stderr),
-                ));
+                let _ = tx.send(UiEvent::Log {
+                    text: line.to_string(),
+                    error: matches!(stream, Stream::Stderr),
+                    status: true,
+                });
             };
             let dpi = display_dpi(display, &tx, &log_path);
-            install::repair(
+            let report = install::repair(
                 &SetupOptions {
                     prefix: prefix.clone(),
                     installer: None,
@@ -474,14 +541,15 @@ fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
                     log_path: Some(log_path.clone()),
                     install_deps: false,
                     elevation: default_elevation(),
+                    distro_override: cfg.distro_override.clone(),
                 },
                 &mut send,
             )?;
-            Ok(())
+            Ok(report.failures)
         })();
         match result {
-            Ok(()) => {
-                let _ = tx.send(UiEvent::JobDone("repair"));
+            Ok(failures) => {
+                let _ = tx.send(UiEvent::JobDone("repair", failures));
             }
             Err(error) => job_failed(&tx, "repair", &log_path, &error),
         }
@@ -491,26 +559,35 @@ fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
 fn spawn_launch(cfg: Config, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
-        let log_path = job_log(&prefix, "launch");
-        let options = launch::LaunchOptions {
-            prefix,
-            args: Vec::new(),
-            dry_run: false,
-            log_path: Some(log_path.clone()),
-        };
-        let mut send = |stream: Stream, line: &str| {
-            let _ = tx.send(UiEvent::Log(
-                line.to_string(),
-                matches!(stream, Stream::Stderr),
-            ));
-        };
-        match launch::launch(&options, &mut send) {
+        let log_path = prefix.join("logs/launch.log");
+        let result = (|| -> anyhow::Result<launch::LaunchOutcome> {
+            validate_prefix(&prefix)?;
+            install::ensure_installed(&prefix)?;
+            fs::create_dir_all(prefix.join("logs"))?;
+            let _ = fs::write(&log_path, b"");
+            let options = launch::LaunchOptions {
+                prefix,
+                args: Vec::new(),
+                dry_run: false,
+                log_path: Some(log_path.clone()),
+            };
+            let mut send = |stream: Stream, line: &str| {
+                let _ = tx.send(UiEvent::Log {
+                    text: line.to_string(),
+                    error: matches!(stream, Stream::Stderr),
+                    status: true,
+                });
+            };
+            launch::launch(&options, &mut send)
+        })();
+        match result {
             Ok(outcome) => {
-                let _ = tx.send(UiEvent::Log(
-                    format!("launched {}", outcome.target.display()),
-                    false,
-                ));
-                let _ = tx.send(UiEvent::JobDone("launch"));
+                let _ = tx.send(UiEvent::Log {
+                    text: format!("launched {}", outcome.target.display()),
+                    error: false,
+                    status: true,
+                });
+                let _ = tx.send(UiEvent::JobDone("launch", Vec::new()));
             }
             Err(error) => job_failed(&tx, "launch", &log_path, &error),
         }
@@ -527,26 +604,32 @@ fn spawn_uninstall(cfg: Config, tx: Sender<UiEvent>) {
             log_path: Some(log_path.clone()),
         };
         let mut send = |stream: Stream, line: &str| {
-            let _ = tx.send(UiEvent::Log(
-                line.to_string(),
-                matches!(stream, Stream::Stderr),
-            ));
+            let _ = tx.send(UiEvent::Log {
+                text: line.to_string(),
+                error: matches!(stream, Stream::Stderr),
+                status: true,
+            });
         };
         match uninstall::uninstall(&options, &mut send) {
             Ok(outcome) => {
                 let mut saved = cfg.clone();
                 saved.prefix = default_prefix();
                 if let Err(error) = saved.save() {
-                    let _ = tx.send(UiEvent::Log(format!("warning: {error:#}"), true));
+                    let _ = tx.send(UiEvent::Log {
+                        text: format!("warning: {error:#}"),
+                        error: true,
+                        status: false,
+                    });
                 }
-                let _ = tx.send(UiEvent::Log(
-                    format!(
+                let _ = tx.send(UiEvent::Log {
+                    text: format!(
                         "removed {} entries, prefix removed={}",
                         outcome.removed_entries, outcome.prefix_removed
                     ),
-                    false,
-                ));
-                let _ = tx.send(UiEvent::JobDone("uninstall"));
+                    error: false,
+                    status: true,
+                });
+                let _ = tx.send(UiEvent::JobDone("uninstall", Vec::new()));
             }
             Err(error) => job_failed(&tx, "uninstall", &log_path, &error),
         }
@@ -580,7 +663,11 @@ fn append_log(path: &Path, text: &str) {
 
 fn job_info(tx: &Sender<UiEvent>, log_path: &Path, text: String) {
     append_log(log_path, &text);
-    let _ = tx.send(UiEvent::Log(text, false));
+    let _ = tx.send(UiEvent::Log {
+        text,
+        error: false,
+        status: true,
+    });
 }
 
 fn job_failed(tx: &Sender<UiEvent>, kind: &'static str, log_path: &Path, error: &anyhow::Error) {

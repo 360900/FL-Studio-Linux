@@ -129,12 +129,12 @@ impl Manifest {
         self.status_of(step) == StepStatus::Done
     }
 
-    /// Steps that must be redone because they never completed.
+    /// Steps that must be redone because they never completed or were not skipped.
     pub fn incomplete_steps(&self) -> Vec<&'static str> {
         ALL_STEPS
             .iter()
             .copied()
-            .filter(|step| self.status_of(step) != StepStatus::Done)
+            .filter(|step| !matches!(self.status_of(step), StepStatus::Done | StepStatus::Skipped))
             .collect()
     }
 }
@@ -160,13 +160,14 @@ mod tests {
         assert_eq!(manifest.incomplete_steps().len(), ALL_STEPS.len());
 
         manifest.mark(STEP_WINE, StepStatus::Done, Some("11.22".into()));
+        manifest.mark(STEP_DXVK, StepStatus::Skipped, None);
         manifest.fl_exe = Some("/x/FL64.exe".into());
         manifest.save(prefix).unwrap();
 
         let loaded = Manifest::load(prefix).unwrap().unwrap();
         assert_eq!(loaded.schema, SCHEMA);
         assert!(loaded.is_done(STEP_WINE));
-        assert_eq!(loaded.incomplete_steps().len(), ALL_STEPS.len() - 1);
+        assert_eq!(loaded.incomplete_steps().len(), ALL_STEPS.len() - 2);
         assert_eq!(loaded.fl_exe.as_deref(), Some("/x/FL64.exe"));
     }
 
