@@ -20,6 +20,9 @@ pub struct DoctorReport {
     pub gpus: Vec<Gpu>,
     pub vulkan_icds: Vec<String>,
     pub deps: Vec<DepCheck>,
+    /// Host libraries the private Wine build needs but the linker cannot find.
+    pub missing_libraries: Vec<String>,
+    pub pipewire: bool,
     pub package_notes: Vec<String>,
     pub config_path: PathBuf,
     pub prefix: PathBuf,
@@ -101,6 +104,11 @@ pub fn run(cfg: &Config) -> DoctorReport {
         gpus: gpu::detect(),
         vulkan_icds: deps::vulkan_icds(),
         deps: deps::check_all(),
+        missing_libraries: deps::missing_libraries()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        pipewire: crate::audio::pipewire_running(),
         package_notes,
         config_path: config_path(),
         prefix,

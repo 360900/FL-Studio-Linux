@@ -703,6 +703,7 @@ fn apply_report(
         .iter()
         .filter(|dep| dep.required && !dep.found)
         .map(|dep| dep.command)
+        .chain(report.missing_libraries.iter().map(String::as_str))
         .collect();
     let has_download = deps::has_download_tool(&report.deps);
     let deps = if missing.is_empty() && has_download {
@@ -765,6 +766,13 @@ fn apply_report(
         false,
     );
     push_log(logs, format!("wine: {wine}"), false);
+    if !report.pipewire {
+        push_log(
+            logs,
+            "pipewire: not running; WinePipe is skipped".to_string(),
+            true,
+        );
+    }
     push_log(logs, format!("webview2: {webview}"), false);
     let mut deps_line = format!("deps: {found}/{} found", report.deps.len());
     if !missing.is_empty() {

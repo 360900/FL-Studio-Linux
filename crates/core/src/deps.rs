@@ -156,6 +156,58 @@ pub fn has_download_tool(checks: &[DepCheck]) -> bool {
         .any(|c| (c.command == "curl" || c.command == "wget") && c.found)
 }
 
+/// Host libraries the private Wine build loads at runtime: fonts, X11, TLS
+/// for FL Studio's sign-in, Vulkan for DXVK, and ALSA for audio.
+pub const HOST_LIBRARIES: &[&str] = &[
+    "libfreetype.so.6",
+    "libfontconfig.so.1",
+    "libX11.so.6",
+    "libgnutls.so.30",
+    "libvulkan.so.1",
+    "libasound.so.2",
+];
+
+/// The 64-bit libraries from `HOST_LIBRARIES` the dynamic linker cannot find.
+/// Empty when `ldconfig` is unavailable, since nothing is known then.
+pub fn missing_libraries() -> Vec<&'static str> {
+    let Some(cache) = ldconfig_cache() else {
+        return Vec::new();
+    };
+    HOST_LIBRARIES
+        .iter()
+        .copied()
+        .filter(|name| !cache_has(&cache, name))
+        .collect()
+}
+
+/// Whether a 64-bit library is installed, or `None` without `ldconfig`.
+pub fn library_present(name: &str) -> Option<bool> {
+    ldconfig_cache().map(|cache| cache_has(&cache, name))
+}
+
+fn ldconfig_cache() -> Option<String> {
+    // Debian keeps ldconfig in /sbin, outside a normal user's PATH.
+    ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"]
+        .iter()
+        .find_map(|program| {
+            Command::new(program)
+                .arg("-p")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        })
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Lines look like `\tlibvulkan.so.1 (libc6,x86-64) => /usr/lib/libvulkan.so.1`.
+fn cache_has(cache: &str, name: &str) -> bool {
+    cache.lines().any(|line| {
+        let line = line.trim_start();
+        line.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(' ') && rest.contains("x86-64"))
+    })
+}
+
 /// A Vulkan driver manifest and the API version it declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VulkanIcd {
@@ -302,6 +354,17 @@ mod tests {
         assert_eq!(icd_api_version(old), Some((1, 2)));
         assert_eq!(icd_api_version(r#"{"ICD":{}}"#), None);
         assert_eq!(icd_api_version("not json"), None);
+    }
+
+    #[test]
+    fn reads_the_linker_cache() {
+        let cache = "1234 libs found in cache `/etc/ld.so.cache'\n\
+            \tlibvulkan.so.1 (libc6,x86-64) => /usr/lib/libvulkan.so.1\n\
+            \tlibgnutls.so.30 (libc6) => /usr/lib32/libgnutls.so.30\n\
+            \tlibX11.so.6.4 (libc6,x86-64) => /usr/lib/libX11.so.6.4\n";
+        assert!(cache_has(cache, "libvulkan.so.1"));
+        assert!(!cache_has(cache, "libgnutls.so.30"));
+        assert!(!cache_has(cache, "libX11.so.6"));
     }
 
     #[test]

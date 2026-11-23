@@ -285,6 +285,23 @@ fn print_report(report: &DoctorReport) {
         if report.webview2 { "yes" } else { "no" }
     );
 
+    println!(
+        "  pipewire      {}",
+        if report.pipewire {
+            "running"
+        } else {
+            "not running (WinePipe is skipped)"
+        }
+    );
+    if report.missing_libraries.is_empty() {
+        println!("  libraries     ok");
+    } else {
+        println!(
+            "  libraries     MISSING {}",
+            report.missing_libraries.join(", ")
+        );
+    }
+
     let found = report.deps.iter().filter(|dep| dep.found).count();
     println!("  dependencies  {}/{} found", found, report.deps.len());
     for dep in &report.deps {

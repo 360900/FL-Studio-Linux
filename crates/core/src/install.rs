@@ -417,7 +417,21 @@ fn install_audio(opts: &SetupOptions, report: &mut Report<'_>, outcome: &mut Set
             } else {
                 StepStatus::Skipped
             };
-            mark(&opts.prefix, STEP_AUDIO, status, None, opts.dry_run);
+            if !result.installed
+                && result.driver != AudioDriver::None
+                && let Some(detail) = &result.detail
+            {
+                outcome
+                    .failures
+                    .push(format!("{}: {detail}", result.driver.title()));
+            }
+            mark(
+                &opts.prefix,
+                STEP_AUDIO,
+                status,
+                result.detail,
+                opts.dry_run,
+            );
         }
         Err(error) => {
             report.warn(format!("low-latency audio failed: {error}"));
@@ -485,7 +499,11 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
     let checks = deps::check_all();
     let missing = deps::missing(&checks);
     let has_download = deps::has_download_tool(&checks);
-    if missing.is_empty() && has_download {
+    let libraries = deps::missing_libraries();
+    if !libraries.is_empty() {
+        report.info(format!("missing host libraries: {}", libraries.join(", ")));
+    }
+    if missing.is_empty() && has_download && libraries.is_empty() {
         report.info("host dependencies are already present");
         mark(
             &opts.prefix,
@@ -509,6 +527,11 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
         report.info(format!("note: {note}"));
     }
     if plan.steps.is_empty() {
+        if missing.is_empty() && has_download {
+            // The tools are there; the linker check can be wrong on unusual
+            // layouts, so go on and let Wine report what it lacks.
+            return Ok(warn_libraries(opts, report, &libraries));
+        }
         return fail_deps(opts, report, &missing, has_download);
     }
 
@@ -533,6 +556,12 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
             outcome.failed_optional.join(", ")
         ));
     }
+    if !opts.dry_run {
+        let still = deps::missing_libraries();
+        if !still.is_empty() {
+            return Ok(warn_libraries(opts, report, &still));
+        }
+    }
     mark(
         &opts.prefix,
         STEP_DEPS,
@@ -541,6 +570,31 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
         opts.dry_run,
     );
     Ok(true)
+}
+
+fn warn_libraries(opts: &SetupOptions, report: &mut Report<'_>, libraries: &[&str]) -> bool {
+    if libraries.is_empty() {
+        mark(
+            &opts.prefix,
+            STEP_DEPS,
+            StepStatus::Done,
+            None,
+            opts.dry_run,
+        );
+        return true;
+    }
+    let detail = libraries.join(", ");
+    report.warn(format!(
+        "host libraries are still missing: {detail}. Install Wine from your distribution to get them."
+    ));
+    mark(
+        &opts.prefix,
+        STEP_DEPS,
+        StepStatus::Failed,
+        Some(detail),
+        opts.dry_run,
+    );
+    false
 }
 
 fn fail_deps(
