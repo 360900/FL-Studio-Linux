@@ -565,7 +565,7 @@ fn install_wine(
             Ok(archive) => archive,
             Err(error) => {
                 report.warn(format!("Wine {version} download failed: {error:#}"));
-                errors.push(format!("{version}: download failed"));
+                errors.push(format!("{version}: {error:#}"));
                 continue;
             }
         };
@@ -589,7 +589,10 @@ fn install_wine(
                 "Wine {version} extraction failed\n{}",
                 result.tail_text(10)
             ));
-            errors.push(format!("{version}: extraction failed"));
+            errors.push(format!(
+                "{version}: extraction failed ({})",
+                result.tail_text(2).replace('\n', " | ")
+            ));
             continue;
         }
 
@@ -680,7 +683,11 @@ fn link_wine(prefix: &Path, extracted: &Path) -> Result<()> {
                 .with_context(|| format!("removing old Wine link {}", link.display()))?;
         } else if metadata.is_dir() {
             if link.join("bin/wine").is_file() {
-                return Ok(());
+                bail!(
+                    "{} is a custom Wine build; move it away to install {}",
+                    link.display(),
+                    extracted.display()
+                );
             }
             bail!(
                 "{} exists and is not a usable Wine build; remove it manually",

@@ -1,20 +1,26 @@
 //! Small network helpers built on curl/wget so the core stays dependency-free.
 
-use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::deps::which;
 use crate::journal::Report;
-use crate::runner::{self, RunOptions};
+use crate::runner::{self, RunOptions, RunResult};
 
 const USER_AGENT: &str = "fl-studio-linux";
+/// Every download and redirect must stay on HTTPS: the FL Studio and
+/// WebView2 installers have no pinned checksum.
 const CURL_DOWNLOAD: &[&str] = &[
+    "--proto",
+    "=https",
+    "--proto-redir",
+    "=https",
     "-fL",
     "--retry",
     "3",
@@ -33,13 +39,36 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(crate::config::cache_home().join(crate::APP_NAME))
 }
 
-fn file_lock(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.entry(path.to_path_buf()).or_default().clone()
+/// Hold a lock on `.<name>.lock` next to `path` while a file is fetched, so a
+/// background prefetch, the GUI and the CLI never write the same file at
+/// once. The lock is released when the returned file is dropped.
+fn lock_download(path: &Path, cancel: Option<&Arc<AtomicBool>>) -> Result<File> {
+    let parent = path.parent().context("download path has no folder")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .context("download path has no file name")?
+        .to_string_lossy();
+    let lock_path = parent.join(format!(".{name}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    bail!("download cancelled");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Filesystems without locks: carry on unlocked.
+            Err(TryLockError::Error(_)) => return Ok(file),
+        }
+    }
 }
 
 /// Download `url` into the cache as `name`. A cached copy is revalidated with
@@ -64,8 +93,7 @@ pub(crate) fn download_cached_cancellable(
 ) -> Result<PathBuf> {
     let path = cache_dir()?.join(name);
     // A background prefetch may be fetching the same file.
-    let lock = file_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _lock = lock_download(&path, cancel.as_ref())?;
     if cancel
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
@@ -77,7 +105,20 @@ pub(crate) fn download_cached_cancellable(
         return Ok(path);
     }
     if which("curl").is_none() {
-        report.info(format!("using cached {}", path.display()));
+        // wget cannot revalidate into a separate file, so fetch it again
+        // and keep the cached copy only when that fails.
+        report.info(format!("refreshing the cached {name}"));
+        if let Err(error) = download_with_cancel(report, url, &path, stall, cancel.clone()) {
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                bail!("download cancelled");
+            }
+            report.warn(format!(
+                "could not refresh {name} ({error:#}); using the cached copy"
+            ));
+        }
         return Ok(path);
     }
 
@@ -92,22 +133,24 @@ pub(crate) fn download_cached_cancellable(
         .arg("-o")
         .arg(&partial)
         .arg(url);
-    match run_with_cancel(report, cmd, stall, cancel.clone()) {
+    let checked = run_with_cancel(report, cmd, stall, cancel.clone());
+    match checked {
         // On 304 Not Modified curl writes no file.
-        Ok(true)
-            if partial
-                .metadata()
-                .map(|meta| meta.len() > 0)
-                .unwrap_or(false) =>
+        Ok(result)
+            if result.success()
+                && partial
+                    .metadata()
+                    .map(|meta| meta.len() > 0)
+                    .unwrap_or(false) =>
         {
             finish(partial, &path)?;
             report.info(format!("downloaded a newer {name}"));
         }
-        Ok(true) => {
+        Ok(result) if result.success() => {
             let _ = std::fs::remove_file(&partial);
             report.info(format!("cached {name} is current"));
         }
-        _ => {
+        other => {
             let _ = std::fs::remove_file(&partial);
             if cancel
                 .as_ref()
@@ -115,8 +158,12 @@ pub(crate) fn download_cached_cancellable(
             {
                 bail!("download cancelled");
             }
+            let reason = match other {
+                Ok(result) => failure("curl", &result),
+                Err(error) => format!("{error:#}"),
+            };
             report.warn(format!(
-                "could not check for a newer {name}; using the cached copy"
+                "could not check for a newer {name} ({reason}); using the cached copy"
             ));
         }
     }
@@ -133,8 +180,7 @@ pub(crate) fn download_verified(
     stall: Duration,
 ) -> Result<PathBuf> {
     let path = cache_dir()?.join(name);
-    let lock = file_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _lock = lock_download(&path, None)?;
     if path.is_file() {
         match sha256_file(&path) {
             Ok(hash) if hash == expected_sha256 => {
@@ -214,9 +260,9 @@ fn download_with_cancel(
             .arg(&partial)
             .arg(url);
         match run_with_cancel(report, cmd, stall, cancel.clone()) {
-            Ok(true) => return finish(partial, destination),
-            Ok(false) => last_error = "curl failed".to_string(),
-            Err(error) => last_error = error.to_string(),
+            Ok(result) if result.success() => return finish(partial, destination),
+            Ok(result) => last_error = failure("curl", &result),
+            Err(error) => last_error = format!("{error:#}"),
         }
         if cancel
             .as_ref()
@@ -229,26 +275,26 @@ fn download_with_cancel(
 
     if has_wget {
         let mut cmd = Command::new("wget");
-        cmd.args(["--tries=3", "--timeout=30", "-U", USER_AGENT, "-O"])
-            .arg(&partial)
-            .arg(url);
-        match run_with_cancel(report, cmd, stall, cancel.clone()) {
-            Ok(true) => return finish(partial, destination),
-            Ok(false) => {
-                last_error = if last_error.is_empty() {
-                    "wget failed".to_string()
-                } else {
-                    format!("{last_error}; wget failed")
-                };
-            }
-            Err(error) => {
-                last_error = if last_error.is_empty() {
-                    error.to_string()
-                } else {
-                    format!("{last_error}; {error}")
-                };
-            }
-        }
+        cmd.args([
+            "--https-only",
+            "--tries=3",
+            "--timeout=30",
+            "-U",
+            USER_AGENT,
+            "-O",
+        ])
+        .arg(&partial)
+        .arg(url);
+        let error = match run_with_cancel(report, cmd, stall, cancel.clone()) {
+            Ok(result) if result.success() => return finish(partial, destination),
+            Ok(result) => failure("wget", &result),
+            Err(error) => format!("{error:#}"),
+        };
+        last_error = if last_error.is_empty() {
+            error
+        } else {
+            format!("{last_error}; {error}")
+        };
     }
 
     let _ = std::fs::remove_file(&partial);
@@ -260,13 +306,27 @@ fn run_with_cancel(
     cmd: Command,
     stall: Duration,
     cancel: Option<Arc<AtomicBool>>,
-) -> Result<bool> {
+) -> Result<RunResult> {
     let mut options = RunOptions::default().stall(stall);
     if let Some(flag) = cancel {
         options = options.cancel(flag);
     }
-    let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
-    Ok(result.success())
+    runner::run(cmd, options, |stream, line| report.line(stream, line))
+}
+
+/// Why a download tool failed: its exit status or stall, and its last lines.
+fn failure(tool: &str, result: &RunResult) -> String {
+    let reason = if result.stalled {
+        "stalled".to_string()
+    } else {
+        format!("exited with {}", result.status)
+    };
+    let tail = result.tail_text(3);
+    if tail.is_empty() {
+        format!("{tool} {reason}")
+    } else {
+        format!("{tool} {reason}: {}", tail.replace('\n', " | "))
+    }
 }
 
 fn finish(partial: std::path::PathBuf, destination: &Path) -> Result<()> {
@@ -310,5 +370,16 @@ mod tests {
         let hash = sha256_file(&file).unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_held_download_lock_waits_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup.exe");
+        let held = lock_download(&path, None).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(lock_download(&path, Some(&cancel)).is_err());
+        drop(held);
+        assert!(lock_download(&path, Some(&cancel)).is_ok());
     }
 }

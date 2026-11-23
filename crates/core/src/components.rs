@@ -194,7 +194,7 @@ fn winetricks(prefix: &Path, component: &str, report: &mut Report<'_>) -> Result
 fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Result<bool> {
     report.info("MS Gothic musical symbols");
     let destination = fonts_dir(prefix).join(MSGOTHIC_NAME);
-    if destination.is_file() && !dry_run {
+    if !dry_run && msgothic_installed(&destination) {
         report.info("MS Gothic is already installed");
         return Ok(true);
     }
@@ -239,7 +239,11 @@ fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Re
         report.warn(format!("could not create {}: {error}", fonts.display()));
         return Ok(false);
     }
-    if let Err(error) = fs::copy(&cached, &destination) {
+    // Copy beside the target and rename, so an interrupted copy never leaves
+    // a truncated font that looks installed.
+    let temp = fonts.join(format!(".{MSGOTHIC_NAME}.tmp"));
+    if let Err(error) = fs::copy(&cached, &temp).and_then(|_| fs::rename(&temp, &destination)) {
+        let _ = fs::remove_file(&temp);
         report.warn(format!(
             "could not copy MS Gothic to {}: {error}",
             destination.display()
@@ -251,6 +255,12 @@ fn install_msgothic(prefix: &Path, dry_run: bool, report: &mut Report<'_>) -> Re
     wine::run_wineboot_update(prefix, &prefix.join(WINE_DIR_NAME), report);
     report.info(format!("MS Gothic installed at {}", destination.display()));
     Ok(destination.is_file())
+}
+
+/// The font is present and complete.
+fn msgothic_installed(destination: &Path) -> bool {
+    destination.is_file()
+        && http::sha256_file(destination).is_ok_and(|hash| hash == MSGOTHIC_SHA256)
 }
 
 fn fonts_dir(prefix: &Path) -> PathBuf {

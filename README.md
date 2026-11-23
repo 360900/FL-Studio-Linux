@@ -71,7 +71,7 @@ sudo make uninstall
 
 ## Build
 
-Requires Rust 1.88+.
+Requires Rust 1.89+.
 
 ```sh
 make build                   # cargo build --release --locked --workspace
