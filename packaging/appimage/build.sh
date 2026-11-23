@@ -6,8 +6,8 @@ set -eu
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-appdir="target/appimage/AppDir"
-tool="target/appimage/appimagetool"
+appdir="$root/target/appimage/AppDir"
+tool="$root/target/appimage/appimagetool"
 tool_version="1.9.1"
 tool_sha256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 
@@ -29,4 +29,4 @@ if [ ! -x "$tool" ] || ! printf '%s  %s\n' "$tool_sha256" "$tool" | sha256sum -c
 fi
 
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$tool" "$appdir" \
-    "target/appimage/FL_Studio_Linux-$version-x86_64.AppImage"
+    "$root/target/appimage/FL_Studio_Linux-$version-x86_64.AppImage"
