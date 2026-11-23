@@ -1,6 +1,6 @@
 # Maintainer: 360900 <ziyad.koca@hotmail.com>
 pkgname=fl-studio-linux
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Installer and launcher for FL Studio on Linux'
 arch=('x86_64')
