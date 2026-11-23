@@ -132,8 +132,8 @@ diagnostics: `doctor`, `deps`, `wine-setup`.
   installer skips WebView2, the app downloads and installs Microsoft's
   Evergreen runtime itself; a bare FL Studio install in Wine leaves them black.
 - The installer starts Edge WebView2 near the end and can look stuck while its
-  services keep running. The watchdog stops the prefix after FL64.exe has been
-  stable for a while.
+  services keep running. The watchdog stops the prefix once FL Studio's folder
+  has stopped changing for a while.
 - 32-bit plugins are fragile under Wine. Prefer the 64-bit versions.
 - On immutable distributions such as Bazzite, install `winetricks`,
   `cabextract` and the Wine libraries with `rpm-ostree` first. The installer

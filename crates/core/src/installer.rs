@@ -2,8 +2,8 @@
 //!
 //! The installer is NSIS and accepts `/S`. It starts Edge WebView2 near the
 //! end, and Edge's services can keep the process alive after FL Studio is
-//! already on disk, so a watchdog stops the prefix once FL64.exe has been
-//! stable for a while.
+//! already on disk, so a watchdog stops the prefix once FL64.exe exists and
+//! the whole Image-Line folder has stopped changing for a while.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,42 +95,42 @@ where
     if let Some(parent) = installer.parent() {
         cmd.current_dir(parent);
     }
-    let result = run(&mut report, cmd, &envs, Duration::from_secs(1800));
+    // NSIS prints nothing in silent mode, so a stall timeout would kill any
+    // slow install. The watchdog bounds the run instead.
+    let result = run(&mut report, cmd, &envs);
 
     cancel.store(true, Ordering::Relaxed);
-    let _ = watchdog.join();
+    let stopped = watchdog.join().unwrap_or(false);
     wine::kill_prefix(&opts.prefix, Some(&wine_dir), &mut report);
     let result = result?;
+    let code = result.status.code().unwrap_or(-1);
 
     let Some(fl_exe) = app_exe(&opts.prefix) else {
-        let code = result.status.code().unwrap_or(-1);
         bail!(
             "the FL Studio installer did not create FL64.exe (exit {code}).\n{}",
             result.tail_text(20)
         );
     };
 
-    if let Some((before_path, before_len, before_modified)) = &before {
-        let meta = fs::metadata(&fl_exe).ok();
-        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        let modified = meta.and_then(|m| m.modified().ok());
-        let unchanged =
-            &fl_exe == before_path && len == *before_len && modified == *before_modified;
-        if unchanged && !result.success() && result.status.code() != Some(199) {
-            let code = result.status.code().unwrap_or(-1);
-            bail!(
-                "the FL Studio installer failed without updating FL64.exe (exit {code}).\n{}",
-                result.tail_text(20)
-            );
-        }
+    let changed = before
+        .as_ref()
+        .is_none_or(|(before_path, before_len, before_modified)| {
+            let meta = fs::metadata(&fl_exe).ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.and_then(|m| m.modified().ok());
+            &fl_exe != before_path || len != *before_len || modified != *before_modified
+        });
+    let exited_cleanly = result.success() || result.status.code() == Some(199);
+    // Only the watchdog's own stop excuses a failed exit, and only once the
+    // new FL Studio is on disk.
+    if !exited_cleanly && !(stopped && changed) {
+        bail!(
+            "the FL Studio installer failed (exit {code}).\n{}",
+            result.tail_text(20)
+        );
     }
-
-    if !result.success() {
-        report.warn(format!(
-            "the installer exited with {}; FL Studio is present at {}",
-            result.status,
-            fl_exe.display()
-        ));
+    if stopped {
+        report.info("stopped the installer's leftover Edge services");
     }
     report.info(format!("FL Studio installed at {}", fl_exe.display()));
 
@@ -214,20 +214,51 @@ fn dry_run(
     report.info("    the installer may report exit code 199 after success");
 }
 
-/// Stop the prefix once FL64.exe appears (or changes on an update) and has
-/// stopped changing. The installer starts Edge services that otherwise keep
-/// the prefix alive forever.
+/// Files, bytes and the newest change time under a folder.
+type TreeSignature = (u64, u64, Option<SystemTime>);
+
+fn tree_signature(dir: &Path) -> TreeSignature {
+    let mut signature: TreeSignature = (0, 0, None);
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            signature.0 += 1;
+            signature.1 += meta.len();
+            let modified = meta.modified().ok();
+            if modified > signature.2 {
+                signature.2 = modified;
+            }
+        }
+    }
+    signature
+}
+
+/// Stop the prefix once FL64.exe appears (or changes on an update) and the
+/// Image-Line folder has stopped changing. The installer starts Edge
+/// services that otherwise keep the prefix alive forever. Returns whether it
+/// stopped the prefix; after 45 minutes it always does.
 fn watch_install(
     prefix: &Path,
     wine_dir: &Path,
     baseline: Option<&(PathBuf, u64, Option<SystemTime>)>,
     cancel: &AtomicBool,
-) {
+) -> bool {
     let started = Instant::now();
-    let mut stable: Option<(PathBuf, u64, Option<SystemTime>, Instant)> = None;
+    let mut stable: Option<(TreeSignature, Instant)> = None;
     while !cancel.load(Ordering::Relaxed) {
         if started.elapsed() > Duration::from_secs(45 * 60) {
-            return;
+            stop_prefix(prefix, wine_dir);
+            return true;
         }
         if let Some(exe) = app_exe(prefix)
             && let Ok(metadata) = fs::metadata(&exe)
@@ -238,10 +269,9 @@ fn watch_install(
                 &exe == old_path && len == *old_len && modified == *old_modified
             });
             if !still_old {
+                let signature = tree_signature(&crate::app_dir(prefix));
                 stable = match stable {
-                    Some((last_exe, last_len, last_modified, since))
-                        if last_exe == exe && last_len == len && last_modified == modified =>
-                    {
+                    Some((last, since)) if last == signature => {
                         // WebView2 still needs to finish after FL64.exe appears;
                         // wait longer until its runtime shows up.
                         let grace = if crate::components::webview2_installed(prefix) {
@@ -251,16 +281,17 @@ fn watch_install(
                         };
                         if since.elapsed() >= grace {
                             stop_prefix(prefix, wine_dir);
-                            return;
+                            return true;
                         }
-                        Some((last_exe, last_len, last_modified, since))
+                        Some((last, since))
                     }
-                    _ => Some((exe, len, modified, Instant::now())),
+                    _ => Some((signature, Instant::now())),
                 };
             }
         }
         std::thread::sleep(Duration::from_secs(5));
     }
+    false
 }
 
 fn stop_prefix(prefix: &Path, wine_dir: &Path) {
@@ -276,13 +307,8 @@ fn stop_prefix(prefix: &Path, wine_dir: &Path) {
         .status();
 }
 
-fn run(
-    report: &mut Report<'_>,
-    cmd: Command,
-    envs: &[(String, String)],
-    stall: Duration,
-) -> Result<RunResult> {
-    let mut options = RunOptions::default().stall(stall);
+fn run(report: &mut Report<'_>, cmd: Command, envs: &[(String, String)]) -> Result<RunResult> {
+    let mut options = RunOptions::default();
     for (key, value) in envs {
         options = options.env(key.clone(), value.clone());
     }
@@ -341,6 +367,22 @@ mod tests {
         let mut lines = Vec::new();
         install(&opts, |_, line| lines.push(line.to_string())).unwrap();
         assert!(lines.join("\n").contains(&installer.display().to_string()));
+    }
+
+    #[test]
+    fn tree_signature_sees_any_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("FL Studio 2026/Plugins");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("a.dll"), b"MZ").unwrap();
+        let first = tree_signature(dir.path());
+        assert_eq!(first.0, 1);
+        assert_eq!(first.1, 2);
+        fs::write(nested.join("b.dll"), b"MZ!").unwrap();
+        let second = tree_signature(dir.path());
+        assert_eq!(second.0, 2);
+        assert_ne!(first, second);
+        assert_eq!(tree_signature(&dir.path().join("missing")), (0, 0, None));
     }
 
     #[test]
