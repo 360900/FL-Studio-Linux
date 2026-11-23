@@ -49,6 +49,9 @@ where
     let prefix = &opts.prefix;
 
     crate::config::validate_prefix(prefix)?;
+    if !opts.dry_run {
+        crate::launch::ensure_not_running(prefix)?;
+    }
     if !opts.dry_run
         && prefix.exists()
         && !crate::config::looks_like_prefix(prefix)

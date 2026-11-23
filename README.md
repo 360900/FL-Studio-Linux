@@ -107,6 +107,8 @@ diagnostics: `doctor`, `deps`, `wine-setup`.
 
 - FL Studio 26.1.4 and later need Wine 11.21 or newer. Do not switch the
   prefix to an older runner.
+- Install, update and repair refuse to run while FL Studio is open from the
+  prefix, since they restart its Wine server. Save and close FL Studio first.
 - FL Studio always starts through the prefix's private Wine build. Launching
   the EXE directly would let the system Wine handle it and break WebView2 and
   DXVK isolation.

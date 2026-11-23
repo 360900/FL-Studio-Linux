@@ -1,6 +1,7 @@
 //! Launch FL Studio with the prefix's own Wine and a stable environment.
 
 use std::fs::{self, OpenOptions};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -216,6 +217,54 @@ fn attach_log(cmd: &mut Command) {
     }
 }
 
+/// Refuse to touch a prefix while FL Studio runs from it: every setup step
+/// stops the prefix's wineserver, which would close FL Studio and lose
+/// unsaved work.
+pub fn ensure_not_running(prefix: &Path) -> Result<()> {
+    if let Some(pid) = running_instance(prefix) {
+        bail!(
+            "FL Studio is running from {} (pid {pid}). Save your work and close it, then try again.",
+            prefix.display()
+        );
+    }
+    Ok(())
+}
+
+/// The pid of an FL Studio process using `prefix`, found through `/proc`.
+pub fn running_instance(prefix: &Path) -> Option<u32> {
+    let wanted = prefix
+        .canonicalize()
+        .unwrap_or_else(|_| prefix.to_path_buf());
+    fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+        let dir = entry.path();
+        let comm = fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
+        if !is_fl_process(comm.trim(), &cmdline) {
+            return None;
+        }
+        let environ = fs::read(dir.join("environ")).ok()?;
+        let value = environ
+            .split(|byte| *byte == 0)
+            .find_map(|var| var.strip_prefix(b"WINEPREFIX="))?;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(value));
+        let path = path.canonicalize().unwrap_or(path);
+        (path == wanted).then_some(pid)
+    })
+}
+
+fn is_fl_process(comm: &str, cmdline: &[u8]) -> bool {
+    let is_fl = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        let file = name.rsplit(['\\', '/']).next().unwrap_or(&name);
+        file == "fl64.exe" || file == "fl.exe"
+    };
+    is_fl(comm)
+        || cmdline
+            .split(|byte| *byte == 0)
+            .any(|arg| is_fl(&String::from_utf8_lossy(arg)))
+}
+
 pub fn wayland_session() -> bool {
     std::env::var("XDG_SESSION_TYPE")
         .map(|value| value.eq_ignore_ascii_case("wayland"))
@@ -308,6 +357,26 @@ mod tests {
         assert_eq!(outcome.target, wine);
         assert_eq!(outcome.args[0], "start");
         assert_eq!(outcome.args[1], "flstudio://auth?code=1");
+    }
+
+    #[test]
+    fn recognizes_fl_studio_processes() {
+        let cmdline = b"C:\\Program Files\\Image-Line\\FL Studio 2026\\FL64.exe\0";
+        assert!(is_fl_process("wine64-preload", cmdline));
+        assert!(is_fl_process("FL64.exe", b""));
+        assert!(is_fl_process(
+            "x",
+            b"/wine/bin/wine\0C:\\FL Studio\\FL.exe\0"
+        ));
+        assert!(!is_fl_process("wineserver", b"/wine/bin/wineserver\0"));
+        assert!(!is_fl_process("x", b"C:\\FL Studio\\FLEngine.exe\0"));
+    }
+
+    #[test]
+    fn nothing_runs_from_a_fresh_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(running_instance(dir.path()).is_none());
+        assert!(ensure_not_running(dir.path()).is_ok());
     }
 
     #[test]

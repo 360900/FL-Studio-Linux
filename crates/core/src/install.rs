@@ -66,6 +66,9 @@ where
     let mut outcome = SetupReport::default();
 
     crate::config::validate_prefix(&opts.prefix)?;
+    if !opts.dry_run {
+        crate::launch::ensure_not_running(&opts.prefix)?;
+    }
     report.info("FL Studio installation");
 
     if opts.install_deps {
@@ -182,6 +185,9 @@ where
     let mut outcome = SetupReport::default();
 
     crate::config::validate_prefix(&opts.prefix)?;
+    if !opts.dry_run {
+        crate::launch::ensure_not_running(&opts.prefix)?;
+    }
     report.info("FL Studio update");
     ensure_installed(&opts.prefix)?;
 
@@ -230,6 +236,9 @@ where
     let mut outcome = SetupReport::default();
 
     crate::config::validate_prefix(&opts.prefix)?;
+    if !opts.dry_run {
+        crate::launch::ensure_not_running(&opts.prefix)?;
+    }
     report.info("FL Studio repair");
     ensure_installed(&opts.prefix)?;
 
