@@ -21,15 +21,19 @@ struct Monitor {
 /// chosen. With several monitors the highest DPI wins, since Wine has a
 /// single global value.
 pub fn detect_dpi() -> Option<(u32, String)> {
-    let monitors = if fl_studio_linux_core::launch::wayland_session() {
+    let mut monitors = if fl_studio_linux_core::launch::wayland_session() {
         wayland_monitors()
     } else {
-        x11_monitors()
+        Vec::new()
     };
-    let x = wine::detect_x_scaling();
+    // Also when the Wayland connection fails, e.g. without WAYLAND_DISPLAY.
+    if monitors.is_empty() {
+        monitors = x11_monitors();
+    }
     monitors
         .into_iter()
         .map(|monitor| {
+            let x = wine::detect_x_scaling(Some(monitor.resolution), monitor.scale);
             let dpi = wine::recommended_dpi(Some(monitor.resolution), monitor.scale, x);
             let (width, height) = monitor.resolution;
             let summary = format!(
@@ -184,7 +188,7 @@ fn x11_monitors() -> Vec<Monitor> {
         .map_or(1.0, |dpi| dpi / 96.0);
     command_stdout("xrandr", &["--current"])
         .map(|output| {
-            xrandr_resolutions(&output)
+            wine::xrandr_resolutions(&output)
                 .into_iter()
                 .map(|resolution| Monitor { resolution, scale })
                 .collect()
@@ -208,41 +212,9 @@ fn xft_dpi(resources: &str) -> Option<f32> {
     })
 }
 
-/// The current mode of each connected output, e.g.
-/// `eDP-1 connected primary 2560x1600+0+0 (normal ...) 302mm x 189mm`.
-fn xrandr_resolutions(output: &str) -> Vec<(u32, u32)> {
-    output
-        .lines()
-        .filter(|line| line.contains(" connected"))
-        .filter_map(|line| line.split_whitespace().find_map(parse_geometry))
-        .collect()
-}
-
-fn parse_geometry(token: &str) -> Option<(u32, u32)> {
-    let (size, _) = token.split_once('+')?;
-    let (width, height) = size.split_once('x')?;
-    Some((width.parse().ok()?, height.parse().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_xrandr_connected_outputs() {
-        let output = "Screen 0: minimum 8 x 8, current 4480 x 1440, maximum 32767 x 32767\n\
-            eDP-1 connected primary 1920x1080+0+0 (normal left inverted right) 344mm x 194mm\n   \
-            1920x1080     60.00*+\n\
-            HDMI-1 disconnected (normal left inverted right x axis y axis)\n\
-            DP-1 connected 2560x1440+1920+0 (normal left inverted right) 597mm x 336mm\n";
-        assert_eq!(xrandr_resolutions(output), vec![(1920, 1080), (2560, 1440)]);
-    }
-
-    #[test]
-    fn skips_connected_outputs_without_a_mode() {
-        let output = "DP-2 connected (normal left inverted right x axis y axis)\n";
-        assert!(xrandr_resolutions(output).is_empty());
-    }
 
     #[test]
     fn reads_xft_dpi() {

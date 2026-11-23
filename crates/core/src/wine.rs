@@ -792,7 +792,8 @@ pub(crate) fn wine_env(prefix: &Path, wine_dir: &Path, debug: &str) -> Vec<(Stri
 pub enum XScaling {
     /// X11 clients get physical pixels: X11 sessions, KDE's default.
     Physical,
-    /// GNOME's default: mutter renders X11 clients at 1x and upscales them.
+    /// GNOME's and most wlroots compositors' default: X11 clients render at
+    /// 1x and the compositor upscales them.
     Upscaled,
     /// GNOME with `xwayland-native-scaling`: X11 clients get a canvas at the
     /// scale rounded up (2x at 125%), which mutter then shrinks.
@@ -803,18 +804,65 @@ impl XScaling {
     pub fn label(&self) -> &'static str {
         match self {
             XScaling::Physical => "physical pixels",
-            XScaling::Upscaled => "GNOME upscales X11 apps",
-            XScaling::RoundedUp => "GNOME XWayland native scaling",
+            XScaling::Upscaled => "the compositor upscales X11 apps",
+            XScaling::RoundedUp => "XWayland native scaling",
         }
     }
 }
 
-pub fn detect_x_scaling() -> XScaling {
-    let gnome = std::env::var("XDG_CURRENT_DESKTOP")
-        .map(|desktop| desktop.to_ascii_lowercase().contains("gnome"))
-        .unwrap_or(false);
-    if !gnome || !crate::launch::wayland_session() {
+/// How X11 apps are scaled on a monitor with this physical resolution and
+/// host scale. On Wayland, XWayland's own screen size tells: the physical
+/// size, the logical size (upscaled) or the logical size times the scale
+/// rounded up. When that cannot be measured, the desktop's default decides.
+pub fn detect_x_scaling(resolution: Option<(u32, u32)>, scale: f32) -> XScaling {
+    if !crate::launch::wayland_session() {
         return XScaling::Physical;
+    }
+    let measured = resolution.and_then(|resolution| {
+        let output = Command::new("xrandr")
+            .arg("--current")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let sizes = xrandr_resolutions(&String::from_utf8_lossy(&output.stdout));
+        classify_xwayland(resolution, scale, &sizes)
+    });
+    measured.unwrap_or_else(desktop_x_scaling)
+}
+
+fn classify_xwayland(physical: (u32, u32), scale: f32, sizes: &[(u32, u32)]) -> Option<XScaling> {
+    // At 1x every interpretation gives the same size.
+    if scale <= 1.0 {
+        return None;
+    }
+    let long = physical.0.max(physical.1) as f32;
+    let logical = long / scale;
+    let near = |a: f32, b: f32| (a - b).abs() <= 2.0;
+    sizes.iter().find_map(|&(width, height)| {
+        let size = width.max(height) as f32;
+        if near(size, long) {
+            Some(XScaling::Physical)
+        } else if near(size, logical) {
+            Some(XScaling::Upscaled)
+        } else if near(size, logical * scale.ceil()) {
+            Some(XScaling::RoundedUp)
+        } else {
+            None
+        }
+    })
+}
+
+/// GNOME upscales unless native scaling is on, KDE hands X11 apps physical
+/// pixels, and wlroots compositors such as sway and Hyprland upscale.
+fn desktop_x_scaling() -> XScaling {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if desktop.contains("kde") {
+        return XScaling::Physical;
+    }
+    if !desktop.contains("gnome") {
+        return XScaling::Upscaled;
     }
     let features = Command::new("gsettings")
         .args(["get", "org.gnome.mutter", "experimental-features"])
@@ -832,6 +880,22 @@ pub fn detect_x_scaling() -> XScaling {
 
 fn has_native_xwayland_scaling(features: &str) -> bool {
     features.contains("'xwayland-native-scaling'")
+}
+
+/// The current mode of each connected output, e.g.
+/// `eDP-1 connected primary 2560x1600+0+0 (normal ...) 302mm x 189mm`.
+pub fn xrandr_resolutions(output: &str) -> Vec<(u32, u32)> {
+    output
+        .lines()
+        .filter(|line| line.contains(" connected"))
+        .filter_map(|line| line.split_whitespace().find_map(parse_geometry))
+        .collect()
+}
+
+fn parse_geometry(token: &str) -> Option<(u32, u32)> {
+    let (size, _) = token.split_once('+')?;
+    let (width, height) = size.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
 }
 
 /// Wine DPI for a display, in the 12-DPI steps of Wine's scaling slider.
@@ -925,6 +989,37 @@ mod tests {
         );
         assert_eq!(recommended_dpi(None, 1.0, XScaling::RoundedUp), 96);
         assert_eq!(recommended_dpi(None, 2.5, XScaling::RoundedUp), 288);
+    }
+
+    #[test]
+    fn measures_how_xwayland_is_scaled() {
+        let physical = (2560, 1600);
+        assert_eq!(
+            classify_xwayland(physical, 1.25, &[(2560, 1600)]),
+            Some(XScaling::Physical)
+        );
+        assert_eq!(
+            classify_xwayland(physical, 1.25, &[(2048, 1280)]),
+            Some(XScaling::Upscaled)
+        );
+        assert_eq!(
+            classify_xwayland(physical, 1.25, &[(4096, 2560)]),
+            Some(XScaling::RoundedUp)
+        );
+        assert_eq!(classify_xwayland(physical, 1.0, &[(2560, 1600)]), None);
+        assert_eq!(classify_xwayland(physical, 1.5, &[(1920, 1080)]), None);
+    }
+
+    #[test]
+    fn parses_xrandr_connected_outputs() {
+        let output = "Screen 0: minimum 8 x 8, current 4480 x 1440, maximum 32767 x 32767\n\
+            eDP-1 connected primary 1920x1080+0+0 (normal left inverted right) 344mm x 194mm\n   \
+            1920x1080     60.00*+\n\
+            HDMI-1 disconnected (normal left inverted right x axis y axis)\n\
+            DP-1 connected 2560x1440+1920+0 (normal left inverted right) 597mm x 336mm\n";
+        assert_eq!(xrandr_resolutions(output), vec![(1920, 1080), (2560, 1440)]);
+        let no_mode = "DP-2 connected (normal left inverted right x axis y axis)\n";
+        assert!(xrandr_resolutions(no_mode).is_empty());
     }
 
     #[test]

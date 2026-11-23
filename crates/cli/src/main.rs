@@ -175,7 +175,30 @@ fn main() -> Result<()> {
     if !matches!(cli.command, Command::Doctor { .. } | Command::Deps { .. }) {
         packages::ensure_not_root()?;
     }
-    let cfg = Config::load()?;
+    // Reading the system or launching an explicit prefix needs no config,
+    // so a broken file must not take the menu entry down with it.
+    let lenient = matches!(
+        cli.command,
+        Command::Doctor { .. }
+            | Command::Launch { .. }
+            | Command::Uninstall {
+                prefix: Some(_),
+                ..
+            }
+    );
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(error) if lenient => {
+            eprintln!("warning: {error:#}; using the default settings");
+            Config::default()
+        }
+        Err(error) => {
+            return Err(error.context(format!(
+                "fix or delete {}",
+                fl_studio_linux_core::config::config_path().display()
+            )));
+        }
+    };
 
     match cli.command {
         Command::Doctor { json } => {
@@ -426,7 +449,12 @@ fn resolve_dpi(dpi: Option<u32>) -> Option<u32> {
             Some(dpi)
         }
         None => {
-            println!("  dpi       unchanged (no display detected)");
+            let hint = if deps::which("xrandr").is_none() {
+                "; install xrandr to detect it"
+            } else {
+                ""
+            };
+            println!("  dpi       unchanged (no display detected{hint})");
             None
         }
     }

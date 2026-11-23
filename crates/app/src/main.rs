@@ -1,7 +1,9 @@
 slint::include_modules!();
 
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -26,6 +28,7 @@ use slint::{ComponentHandle, LogicalSize, Model, VecModel};
 
 enum UiEvent {
     Doctor(Box<DoctorReport>),
+    DoctorFailed(String),
     Log {
         text: String,
         error: bool,
@@ -55,11 +58,18 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let (tx, rx) = mpsc::channel::<UiEvent>();
     spawn_doctor(cfg.clone(), tx.clone());
+    // A job is running, as opposed to the startup check, which may be closed.
+    let job_running = Rc::new(Cell::new(false));
+    // The user tried to close during a job; keep saying why it stays open.
+    let close_blocked = Rc::new(Cell::new(false));
+    // The prefix the window shows, which the uninstall dialog names.
+    let shown_prefix = Rc::new(RefCell::new(cfg.prefix.clone()));
 
     {
         let weak = ui.as_weak();
         let cfg = cfg.clone();
         let tx = tx.clone();
+        let job_running = job_running.clone();
         ui.on_install_clicked(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -69,7 +79,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
-            start_job(&ui, "Installing…");
+            start_job(&ui, &job_running, "Installing…");
             spawn_install(cfg, display, tx.clone());
         });
     }
@@ -77,6 +87,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let cfg = cfg.clone();
         let tx = tx.clone();
+        let job_running = job_running.clone();
         ui.on_launch_clicked(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -85,7 +96,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
-            start_job(&ui, "Opening…");
+            start_job(&ui, &job_running, "Opening…");
             spawn_launch(cfg, tx.clone());
         });
     }
@@ -93,6 +104,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let cfg = cfg.clone();
         let tx = tx.clone();
+        let job_running = job_running.clone();
         ui.on_update_clicked(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -102,7 +114,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
-            start_job(&ui, "Updating…");
+            start_job(&ui, &job_running, "Updating…");
             spawn_update(cfg, display, tx.clone());
         });
     }
@@ -110,6 +122,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let cfg = cfg.clone();
         let tx = tx.clone();
+        let job_running = job_running.clone();
         ui.on_repair_clicked(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -119,7 +132,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
             let display = display_info(&ui);
-            start_job(&ui, "Repairing…");
+            start_job(&ui, &job_running, "Repairing…");
             spawn_repair(cfg, display, tx.clone());
         });
     }
@@ -127,6 +140,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         let cfg = cfg.clone();
         let tx = tx.clone();
+        let job_running = job_running.clone();
+        let shown_prefix = shown_prefix.clone();
         ui.on_uninstall_clicked(move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -135,8 +150,28 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             let cfg = Config::load().unwrap_or_else(|_| cfg.clone());
-            start_job(&ui, "Uninstalling…");
-            spawn_uninstall(cfg, tx.clone());
+            // Delete the folder the dialog named, even if the config changed
+            // since the window last checked.
+            let prefix = shown_prefix.borrow().clone();
+            start_job(&ui, &job_running, "Uninstalling…");
+            spawn_uninstall(cfg, prefix, tx.clone());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let job_running = job_running.clone();
+        let close_blocked = close_blocked.clone();
+        ui.window().on_close_requested(move || {
+            // Closing mid-job would kill it halfway, e.g. during a package
+            // install or while the prefix is being deleted.
+            if !job_running.get() {
+                return slint::CloseRequestResponse::HideWindow;
+            }
+            close_blocked.set(true);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text("Wait for this to finish, then close the window".into());
+            }
+            slint::CloseRequestResponse::KeepWindowShown
         });
     }
     {
@@ -174,21 +209,33 @@ fn main() -> Result<(), slint::PlatformError> {
                             checking = false;
                             ui.set_busy(false);
                         }
+                        *shown_prefix.borrow_mut() = report.prefix.clone();
                         apply_report(&ui, &logs, *report, keep_state);
                         keep_state = false;
-                        fit_window(&ui);
+                        fit_window_later(&ui);
+                    }
+                    UiEvent::DoctorFailed(message) => {
+                        if checking {
+                            checking = false;
+                            ui.set_busy(false);
+                        }
+                        ui.set_error_text(format!("System check failed: {message}").into());
+                        push_log(&logs, format!("error: system check: {message}"), true);
+                        fit_window_later(&ui);
                     }
                     UiEvent::Log {
                         text,
                         error,
                         status,
                     } => {
-                        if status && !error {
+                        if status && !error && !close_blocked.get() {
                             ui.set_status_text(text.clone().into());
                         }
                         push_log(&logs, text, error);
                     }
                     UiEvent::JobDone(kind, failures) => {
+                        job_running.set(false);
+                        close_blocked.set(false);
                         ui.set_busy(false);
                         ui.set_status_text("".into());
                         match kind {
@@ -206,11 +253,13 @@ fn main() -> Result<(), slint::PlatformError> {
                             ui.set_error_text(summary.clone().into());
                             keep_state = true;
                             push_log(&logs, summary, true);
-                            fit_window(&ui);
+                            fit_window_later(&ui);
                         }
                         spawn_doctor(Config::load().unwrap_or_default(), tx.clone());
                     }
                     UiEvent::JobFailed(kind, message) => {
+                        job_running.set(false);
+                        close_blocked.set(false);
                         ui.set_busy(false);
                         ui.set_state_text(failed_state(kind).into());
                         ui.set_status_text("".into());
@@ -218,7 +267,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         keep_state = true;
                         push_log(&logs, format!("error: {message}"), true);
                         spawn_doctor(Config::load().unwrap_or_default(), tx.clone());
-                        fit_window(&ui);
+                        fit_window_later(&ui);
                     }
                 }
             }
@@ -253,7 +302,7 @@ fn display_info(ui: &MainWindow) -> DisplayInfo {
 
 /// Picks the Wine DPI for the display and logs how it was chosen.
 fn display_dpi(display: DisplayInfo, tx: &Sender<UiEvent>, log_path: &Path) -> u32 {
-    let x = wine::detect_x_scaling();
+    let x = wine::detect_x_scaling(display.resolution, display.scale);
     let dpi = wine::recommended_dpi(display.resolution, display.scale, x);
     let resolution = display
         .resolution
@@ -271,12 +320,24 @@ fn display_dpi(display: DisplayInfo, tx: &Sender<UiEvent>, log_path: &Path) -> u
     dpi
 }
 
-fn start_job(ui: &MainWindow, state: &str) {
+fn start_job(ui: &MainWindow, job_running: &Cell<bool>, state: &str) {
+    job_running.set(true);
     ui.set_busy(true);
     ui.set_error_text("".into());
     ui.set_state_text(state.into());
     ui.set_status_text("Starting…".into());
-    fit_window(ui);
+    fit_window_later(ui);
+}
+
+/// Fit on the next turn, once banners that appear or disappear with the
+/// properties just set have left or joined the layout.
+fn fit_window_later(ui: &MainWindow) {
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        if let Some(ui) = weak.upgrade() {
+            fit_window(&ui);
+        }
+    });
 }
 
 fn done_state(kind: &str) -> &'static str {
@@ -368,10 +429,39 @@ fn push_log(logs: &Rc<VecModel<LogLine>>, text: String, error: bool) {
 }
 
 fn spawn_doctor(cfg: Config, tx: Sender<UiEvent>) {
+    std::thread::spawn(
+        move || match panic::catch_unwind(AssertUnwindSafe(|| doctor::run(&cfg))) {
+            Ok(report) => {
+                let _ = tx.send(UiEvent::Doctor(Box::new(report)));
+            }
+            Err(payload) => {
+                let _ = tx.send(UiEvent::DoctorFailed(panic_message(&payload)));
+            }
+        },
+    );
+}
+
+/// Run a job on its own thread. A panic still ends the job with an error,
+/// so the window never stays busy forever.
+fn spawn_job<F>(kind: &'static str, tx: Sender<UiEvent>, job: F)
+where
+    F: FnOnce(Sender<UiEvent>) + Send + 'static,
+{
     std::thread::spawn(move || {
-        let report = doctor::run(&cfg);
-        let _ = tx.send(UiEvent::Doctor(Box::new(report)));
+        let job_tx = tx.clone();
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| job(job_tx))) {
+            let message = format!("internal error: {}", panic_message(&payload));
+            let _ = tx.send(UiEvent::JobFailed(kind, message));
+        }
     });
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| text.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 fn default_elevation() -> Elevation {
@@ -383,7 +473,7 @@ fn default_elevation() -> Elevation {
 }
 
 fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
-    std::thread::spawn(move || {
+    spawn_job("install", tx, move |tx| {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "install");
         let result = (|| -> anyhow::Result<Vec<String>> {
@@ -449,7 +539,7 @@ fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
 }
 
 fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
-    std::thread::spawn(move || {
+    spawn_job("update", tx, move |tx| {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "update");
         let result = (|| -> anyhow::Result<Vec<String>> {
@@ -516,7 +606,7 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
 }
 
 fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
-    std::thread::spawn(move || {
+    spawn_job("repair", tx, move |tx| {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "repair");
         let result = (|| -> anyhow::Result<Vec<String>> {
@@ -560,7 +650,7 @@ fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
 }
 
 fn spawn_launch(cfg: Config, tx: Sender<UiEvent>) {
-    std::thread::spawn(move || {
+    spawn_job("launch", tx, move |tx| {
         let prefix = cfg.prefix.clone();
         let log_path = prefix.join("logs/launch.log");
         let result = (|| -> anyhow::Result<launch::LaunchOutcome> {
@@ -598,16 +688,15 @@ fn spawn_launch(cfg: Config, tx: Sender<UiEvent>) {
     });
 }
 
-fn spawn_uninstall(cfg: Config, tx: Sender<UiEvent>) {
-    std::thread::spawn(move || {
-        let prefix = cfg.prefix.clone();
+fn spawn_uninstall(cfg: Config, prefix: PathBuf, tx: Sender<UiEvent>) {
+    spawn_job("uninstall", tx, move |tx| {
         let log_path = cache_log("uninstall");
         if let Err(error) = packages::ensure_not_root() {
             job_failed(&tx, "uninstall", &log_path, &error);
             return;
         }
         let options = uninstall::UninstallOptions {
-            prefix,
+            prefix: prefix.clone(),
             dry_run: false,
             log_path: Some(log_path.clone()),
         };
@@ -622,7 +711,9 @@ fn spawn_uninstall(cfg: Config, tx: Sender<UiEvent>) {
             Ok(outcome) => {
                 let mut saved = cfg.clone();
                 saved.prefix = default_prefix();
-                if let Err(error) = saved.save() {
+                if cfg.prefix == prefix
+                    && let Err(error) = saved.save()
+                {
                     let _ = tx.send(UiEvent::Log {
                         text: format!("warning: {error:#}"),
                         error: true,
