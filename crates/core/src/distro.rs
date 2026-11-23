@@ -105,7 +105,12 @@ impl OsRelease {
             Family::Ubuntu
         } else if matched(&["debian"]) {
             Family::Debian
-        } else if matched(&["fedora", "rhel", "centos", "nobara"]) {
+        } else if ["fedora", "nobara", "ultramarine"].contains(&id.as_str()) {
+            Family::Fedora
+        } else if matched(&["rhel", "centos", "almalinux", "rocky", "ol"]) {
+            // Their base repositories ship no Wine or winetricks.
+            Family::Enterprise
+        } else if matched(&["fedora"]) {
             Family::Fedora
         } else if id.starts_with("opensuse") || matched(&["opensuse", "suse"]) {
             Family::Suse
@@ -145,6 +150,8 @@ pub enum Family {
     Ubuntu,
     Debian,
     Fedora,
+    /// RHEL and its rebuilds: Alma, Rocky, CentOS, Oracle Linux.
+    Enterprise,
     Suse,
     Unknown,
 }
@@ -156,6 +163,7 @@ impl Family {
             Family::Ubuntu => "ubuntu",
             Family::Debian => "debian",
             Family::Fedora => "fedora",
+            Family::Enterprise => "enterprise",
             Family::Suse => "suse",
             Family::Unknown => "unknown",
         }
@@ -165,7 +173,7 @@ impl Family {
         match self {
             Family::Arch => "pacman",
             Family::Ubuntu | Family::Debian => "apt-get",
-            Family::Fedora => "dnf",
+            Family::Fedora | Family::Enterprise => "dnf",
             Family::Suse => "zypper",
             Family::Unknown => "",
         }
@@ -222,6 +230,22 @@ mod tests {
     fn other_families() {
         assert_eq!(family_of("ID=debian\n"), Family::Debian);
         assert_eq!(family_of("ID=fedora\n"), Family::Fedora);
+        assert_eq!(
+            family_of("ID=nobara\nID_LIKE=\"rhel centos fedora\"\n"),
+            Family::Fedora
+        );
+        assert_eq!(
+            family_of("ID=ultramarine\nID_LIKE=fedora\n"),
+            Family::Fedora
+        );
+        assert_eq!(
+            family_of("ID=rocky\nID_LIKE=\"rhel centos fedora\"\n"),
+            Family::Enterprise
+        );
+        assert_eq!(
+            family_of("ID=almalinux\nID_LIKE=\"rhel centos fedora\"\n"),
+            Family::Enterprise
+        );
         assert_eq!(
             family_of("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n"),
             Family::Suse

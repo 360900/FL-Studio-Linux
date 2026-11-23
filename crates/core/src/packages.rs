@@ -46,11 +46,51 @@ pub fn plan(os: &OsRelease) -> PackagePlan {
     plan_with(os, None)
 }
 
-fn is_ostree_host() -> bool {
-    Path::new("/run/ostree-booted").exists()
+/// Signs of an image-based system whose package manager cannot change the
+/// running root: rpm-ostree, transactional-update, SteamOS's read-only mode
+/// or a read-only `/usr`.
+fn is_immutable_host() -> bool {
+    [
+        "/run/ostree-booted",
+        "/usr/sbin/transactional-update",
+        "/usr/bin/steamos-readonly",
+    ]
+    .iter()
+    .any(|path| Path::new(path).exists())
+        || std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|text| usr_is_read_only(&text))
 }
 
-fn plan_with(os: &OsRelease, ostree: Option<bool>) -> PackagePlan {
+/// Whether the mount holding `/usr` is read-only, from mountinfo text.
+fn usr_is_read_only(mountinfo: &str) -> bool {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let mount = fields.nth(4)?;
+            let options = fields.next()?;
+            let covers = mount == "/" || mount == "/usr";
+            covers.then_some((mount.len(), options))
+        })
+        // The deepest mount wins, and the last of equal depth is on top.
+        .max_by_key(|(depth, _)| *depth)
+        .is_some_and(|(_, options)| options.split(',').any(|option| option == "ro"))
+}
+
+fn immutable_distro(os: &OsRelease) -> bool {
+    const IDS: &[&str] = &[
+        "bazzite",
+        "steamos",
+        "chimeraos",
+        "microos",
+        "aeon",
+        "kalpa",
+    ];
+    let id = os.id.to_ascii_lowercase();
+    IDS.iter().any(|name| id.contains(name))
+        || os.id_like.iter().any(|like| like.contains("microos"))
+}
+
+fn plan_with(os: &OsRelease, immutable_host: Option<bool>) -> PackagePlan {
     let family = os.family();
     let id = os.id.to_ascii_lowercase();
     let mut notes = Vec::new();
@@ -61,9 +101,9 @@ fn plan_with(os: &OsRelease, ostree: Option<bool>) -> PackagePlan {
                 .to_string(),
         );
     }
-    if id.contains("bazzite") || ostree.unwrap_or_else(is_ostree_host) {
+    if immutable_distro(os) || immutable_host.unwrap_or_else(is_immutable_host) {
         notes.push(format!(
-            "{} is an immutable distribution; automatic dependency installation is disabled.",
+            "{} is an immutable distribution; automatic dependency installation is disabled. Install winetricks, cabextract, 7z and Wine's libraries with its own tools (rpm-ostree, transactional-update, a container) first.",
             os.name()
         ));
         return PackagePlan {
@@ -85,6 +125,20 @@ fn plan_with(os: &OsRelease, ostree: Option<bool>) -> PackagePlan {
                     .to_string(),
             );
             ("debian".to_string(), Vec::new())
+        }
+        Family::Enterprise => {
+            notes.push(
+                "RHEL-based distributions ship no Wine. Install wine, winetricks, cabextract, 7z, tar, xz and unzip manually, for example from EPEL."
+                    .to_string(),
+            );
+            ("enterprise".to_string(), Vec::new())
+        }
+        Family::Unknown if id == "nixos" => {
+            notes.push(
+                "NixOS cannot run the prebuilt Wine build directly. Enable programs.nix-ld with Wine's libraries, and install winetricks, cabextract and p7zip."
+                    .to_string(),
+            );
+            ("nixos".to_string(), Vec::new())
         }
         Family::Unknown => {
             notes.push(
@@ -497,6 +551,34 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("immutable"))
         );
+
+        for text in [
+            "ID=steamos\nID_LIKE=arch\n",
+            "ID=chimeraos\nID_LIKE=arch\n",
+            "ID=\"opensuse-microos\"\nID_LIKE=\"suse opensuse opensuse-tumbleweed microos\"\n",
+        ] {
+            assert!(plan_for(text).steps.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn enterprise_and_nixos_get_manual_notes() {
+        let rocky = plan_for("ID=rocky\nID_LIKE=\"rhel centos fedora\"\n");
+        assert!(rocky.steps.is_empty());
+        assert!(rocky.notes.iter().any(|note| note.contains("EPEL")));
+        let nixos = plan_for("ID=nixos\n");
+        assert!(nixos.steps.is_empty());
+        assert!(nixos.notes.iter().any(|note| note.contains("nix-ld")));
+    }
+
+    #[test]
+    fn detects_a_read_only_usr() {
+        let rw = "22 1 0:21 / / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw\n";
+        assert!(!usr_is_read_only(rw));
+        let ro_root = "22 1 0:21 / / ro,relatime shared:1 - ext4 /dev/sda1 ro\n";
+        assert!(usr_is_read_only(ro_root));
+        let ro_usr = format!("{rw}23 22 0:22 / /usr ro,relatime - erofs overlay ro\n");
+        assert!(usr_is_read_only(&ro_usr));
     }
 
     #[test]
