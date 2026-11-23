@@ -9,8 +9,9 @@ and creates a menu entry that always launches the right environment.
 
 ## Features
 
-- Private Wine 11.22 build (Kron4ek) with Wine 11.21 as a fallback. FL Studio
-  26.1.4 and later need Wine 11.21 or newer for the signature check.
+- Private Wine 11.22 WoW64 build (Kron4ek) with Wine 11.21 as a fallback, so
+  no 32-bit host libraries are needed. FL Studio 26.1.4 and later need Wine
+  11.21 or newer for the signature check.
 - System dependencies for Arch, Ubuntu-family, Fedora and openSUSE
 - Microsoft core fonts (Arial, Verdana and the rest) plus MS Gothic for
   musical symbols, so FLEX, FL Cloud and the Sounds tab render correctly

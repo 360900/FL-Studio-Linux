@@ -3,7 +3,8 @@
 //! FL Studio 26.1.4 and later refuse to start on Wine before 11.21, which
 //! fixed the crypt32 signature check (WineHQ bug 60273). The prefix therefore
 //! always uses a Chromium-free upstream build from Kron4ek, not the distro's
-//! Wine, and records that build inside the prefix.
+//! Wine, and records that build inside the prefix. The WoW64 variant runs
+//! 32-bit code without 32-bit host libraries, so no distro needs multilib.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -359,16 +360,20 @@ fn ensure_wine(
     report: &mut Report<'_>,
 ) -> Result<String> {
     if let Some(existing) = detect_installed_build(prefix) {
+        let initialized = prefix.join("system.reg").exists();
         let usable = supports_fl(&existing);
         let compatible = requested
             .map(|requested| existing == requested)
             .unwrap_or(true);
-        if usable && compatible {
+        // Prefixes from before the WoW64 switch keep their classic build;
+        // an uninitialized one is simply rebuilt on WoW64.
+        let current = initialized || existing == "custom" || installed_build_is_wow64(prefix);
+        if usable && compatible && current {
             report.info(format!("using existing Wine {existing}"));
             return Ok(existing);
         }
 
-        if prefix.join("system.reg").exists() {
+        if initialized {
             if !usable {
                 bail!(
                     "prefix uses Wine {existing}, but FL Studio 26.1.4 and later need Wine 11.21 or newer. Remove {} and rerun to build a new prefix.",
@@ -397,13 +402,30 @@ pub fn detect_installed_build(prefix: &Path) -> Option<String> {
     }
     if let Ok(target) = fs::read_link(&link)
         && let Some(name) = target.file_name().and_then(|name| name.to_str())
-        && let Some(version) = name
-            .strip_prefix("wine-")
-            .and_then(|name| name.strip_suffix("-amd64"))
+        && let Some(version) = name.strip_prefix("wine-").and_then(|name| {
+            name.strip_suffix(WOW64_SUFFIX)
+                .or_else(|| name.strip_suffix(CLASSIC_SUFFIX))
+        })
     {
         return Some(version.to_string());
     }
     Some("custom".to_string())
+}
+
+const WOW64_SUFFIX: &str = "-amd64-wow64";
+/// The pre-WoW64 build, still used by prefixes created with it.
+const CLASSIC_SUFFIX: &str = "-amd64";
+
+/// True when `wine-fl` points at a WoW64 build.
+pub fn installed_build_is_wow64(prefix: &Path) -> bool {
+    fs::read_link(prefix.join(WINE_DIR_NAME))
+        .ok()
+        .and_then(|target| {
+            target
+                .file_name()
+                .map(|name| name.to_string_lossy().ends_with(WOW64_SUFFIX))
+        })
+        .unwrap_or(false)
 }
 
 /// FL Studio 26.1.4 and later require the crypt32 fix from Wine 11.21.
@@ -579,21 +601,16 @@ fn fetch_archive(report: &mut Report<'_>, release: &Release) -> Result<PathBuf> 
 }
 
 fn release_for(version: &str) -> Result<Release> {
-    let (sha256, dir_pattern) = match version {
-        "11.22" => (
-            "cdaaa76c218359d486eb35968892a4c466623b137ed0931ee3f31465ec6539e0",
-            "wine-11.22-amd64",
-        ),
-        "11.21" => (
-            "1f12f2aef4f5d0b5c0548ceecdb20068edc59fcd23a5da481e7059a25070eac9",
-            "wine-11.21-amd64",
-        ),
+    let sha256 = match version {
+        "11.22" => "e2967393d203121195cba94159efe9b575a6fa8fad2815c557036e69285093d8",
+        "11.21" => "33f3c5b56b1deb8f6725539ea006f27b5d781b3b4ae6a8a1f492d8af4fb9dc83",
         other => bail!(
             "unsupported Wine version '{other}' (expected {WINE_VERSION} or {WINE_FALLBACK_VERSION})"
         ),
     };
+    let dir_pattern = wow64_dir_name(version);
     Ok(Release {
-        dir_pattern: dir_pattern.to_string(),
+        dir_pattern: dir_pattern.clone(),
         file_name: format!("{dir_pattern}.tar.xz"),
         url: format!(
             "https://github.com/Kron4ek/Wine-Builds/releases/download/{version}/{dir_pattern}.tar.xz"
@@ -609,19 +626,13 @@ struct Release {
     sha256: String,
 }
 
+fn wow64_dir_name(version: &str) -> String {
+    format!("wine-{version}{WOW64_SUFFIX}")
+}
+
 fn find_wine_dir(prefix: &Path, version: &str) -> Option<PathBuf> {
-    let pattern = format!("wine-{version}-amd64");
-    let entries = fs::read_dir(prefix).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir()
-            && entry.file_name().to_string_lossy().starts_with(&pattern)
-            && path.join("bin/wine").is_file()
-        {
-            return Some(path);
-        }
-    }
-    None
+    let dir = prefix.join(wow64_dir_name(version));
+    (dir.is_dir() && dir.join("bin/wine").is_file()).then_some(dir)
 }
 
 fn link_wine(prefix: &Path, extracted: &Path) -> Result<()> {
@@ -887,8 +898,8 @@ mod tests {
     #[test]
     fn release_assets_match_upstream() {
         let latest = release_for("11.22").unwrap();
-        assert_eq!(latest.file_name, "wine-11.22-amd64.tar.xz");
-        assert_eq!(latest.dir_pattern, "wine-11.22-amd64");
+        assert_eq!(latest.file_name, "wine-11.22-amd64-wow64.tar.xz");
+        assert_eq!(latest.dir_pattern, "wine-11.22-amd64-wow64");
         assert!(latest.url.contains("/releases/download/11.22/"));
         assert_eq!(latest.sha256.len(), 64);
         assert!(release_for("11.20").is_err());
@@ -905,7 +916,7 @@ mod tests {
         assert!(!prefix.exists());
         assert_eq!(report.wine_version.as_deref(), Some("11.22"));
         let text = lines.join("\n");
-        assert!(text.contains("wine-11.22-amd64.tar.xz"));
+        assert!(text.contains("wine-11.22-amd64-wow64.tar.xz"));
         assert!(text.contains("wineboot"));
         assert!(text.contains("winecfg"));
         assert!(text.contains("msedgewebview2.exe"));
@@ -933,25 +944,40 @@ mod tests {
         assert!(text.contains("144"));
     }
 
+    fn fake_build(prefix: &Path, name: &str) {
+        let build = prefix.join(name).join("bin");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("wine"), "fake").unwrap();
+    }
+
     #[test]
     fn detects_build_from_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path();
-        let build = prefix.join("wine-11.22-amd64/bin");
-        fs::create_dir_all(&build).unwrap();
-        fs::write(build.join("wine"), "fake").unwrap();
+        fake_build(prefix, "wine-11.22-amd64-wow64");
+        std::os::unix::fs::symlink("wine-11.22-amd64-wow64", prefix.join(WINE_DIR_NAME)).unwrap();
+
+        assert_eq!(detect_installed_build(prefix).as_deref(), Some("11.22"));
+        assert!(installed_build_is_wow64(prefix));
+    }
+
+    #[test]
+    fn detects_classic_build_from_older_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path();
+        fake_build(prefix, "wine-11.22-amd64");
         std::os::unix::fs::symlink("wine-11.22-amd64", prefix.join(WINE_DIR_NAME)).unwrap();
 
         assert_eq!(detect_installed_build(prefix).as_deref(), Some("11.22"));
+        assert!(!installed_build_is_wow64(prefix));
     }
 
     #[test]
     fn detects_extracted_build() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path();
-        let build = prefix.join("wine-11.21-amd64/bin");
-        fs::create_dir_all(&build).unwrap();
-        fs::write(build.join("wine"), "fake").unwrap();
+        fake_build(prefix, "wine-11.21-amd64-wow64");
+        fake_build(prefix, "wine-11.22-amd64");
 
         assert!(find_wine_dir(prefix, "11.21").is_some());
         assert!(find_wine_dir(prefix, "11.22").is_none());

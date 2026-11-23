@@ -1,12 +1,11 @@
 //! Per-distribution dependency installation plans.
 //!
 //! The FL Studio installer uses its own Wine build, but the host needs the
-//! regular Wine libraries (including their 32-bit variants), winetricks and
-//! the archive tools winetricks downloads fonts with. Commands are rendered as
-//! shell snippets so they can be shown in a dry run, logged, and executed with
-//! sudo or pkexec.
+//! regular 64-bit Wine libraries, winetricks and the archive tools winetricks
+//! downloads fonts with. The private build is WoW64, so no 32-bit libraries
+//! are needed. Commands are rendered as shell snippets so they can be shown in
+//! a dry run, logged, and executed with sudo or pkexec.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -33,13 +32,6 @@ impl PackageStep {
             optional: false,
         }
     }
-
-    fn root_optional(label: impl Into<String>, script: impl Into<String>) -> Self {
-        Self {
-            optional: true,
-            ..Self::root(label, script)
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,20 +43,14 @@ pub struct PackagePlan {
 }
 
 pub fn plan(os: &OsRelease) -> PackagePlan {
-    plan_with(os, None, None)
-}
-
-fn arch_multilib_enabled() -> bool {
-    fs::read_to_string("/etc/pacman.conf")
-        .map(|text| text.lines().any(|line| line.trim() == "[multilib]"))
-        .unwrap_or(true)
+    plan_with(os, None)
 }
 
 fn is_ostree_host() -> bool {
     Path::new("/run/ostree-booted").exists()
 }
 
-fn plan_with(os: &OsRelease, multilib: Option<bool>, ostree: Option<bool>) -> PackagePlan {
+fn plan_with(os: &OsRelease, ostree: Option<bool>) -> PackagePlan {
     let family = os.family();
     let id = os.id.to_ascii_lowercase();
     let mut notes = Vec::new();
@@ -89,7 +75,7 @@ fn plan_with(os: &OsRelease, multilib: Option<bool>, ostree: Option<bool>) -> Pa
     }
 
     let (flavor, steps) = match family {
-        Family::Arch => arch_plan(multilib.unwrap_or_else(arch_multilib_enabled)),
+        Family::Arch => arch_plan(),
         Family::Ubuntu => ubuntu_plan(os),
         Family::Fedora => fedora_plan(),
         Family::Suse => suse_plan(),
@@ -117,21 +103,16 @@ fn plan_with(os: &OsRelease, multilib: Option<bool>, ostree: Option<bool>) -> Pa
     }
 }
 
-fn arch_plan(multilib_enabled: bool) -> (String, Vec<PackageStep>) {
-    let mut steps = Vec::new();
-    if !multilib_enabled {
-        steps.push(PackageStep::root(
-            "Enable the Arch multilib repository",
-            "grep -q '^\\[multilib\\]' /etc/pacman.conf || printf '\\n[multilib]\\nInclude = /etc/pacman.d/mirrorlist\\n' >> /etc/pacman.conf",
-        ));
-    }
-    steps.push(PackageStep::root(
+/// Arch's `wine` keeps TLS, audio and Vulkan as optional dependencies, but
+/// the private build needs them, so they are listed explicitly.
+fn arch_plan() -> (String, Vec<PackageStep>) {
+    let steps = vec![PackageStep::root(
         "Install Wine libraries and installer tools",
         pacman_install(
             "-Syu",
-            "wine winetricks cabextract wget curl 7zip unzip tar xz pciutils icoutils",
+            "wine winetricks cabextract wget curl 7zip unzip tar xz pciutils icoutils gnutls alsa-lib libpulse vulkan-icd-loader libxcomposite libxinerama",
         ),
-    ));
+    )];
     ("arch".to_string(), steps)
 }
 
@@ -154,22 +135,19 @@ fn ubuntu_plan(os: &OsRelease) -> (String, Vec<PackageStep>) {
         (
             format!("ubuntu-{major}.{minor}"),
             format!(
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 wine32:i386 winetricks cabextract wget curl {archive} tar xz-utils pciutils unzip icoutils"
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 winetricks cabextract wget curl {archive} tar xz-utils pciutils unzip icoutils"
             ),
         )
     } else {
-        // Ubuntu derivatives carry their own VERSION_ID scheme, so detect
-        // whether the repo provides `7zip` or `p7zip-full` at install time.
+        // Ubuntu derivatives carry their own VERSION_ID scheme, so detect the
+        // archive package at install time. Older repos also ship a `7zip`
+        // that only provides `7zz`, so `p7zip-full` wins whenever it exists.
         (
             os.id.clone(),
-            "archive=p7zip-full; apt-cache show 7zip >/dev/null 2>&1 && archive=7zip; DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 wine32:i386 winetricks cabextract wget curl \"$archive\" tar xz-utils pciutils unzip icoutils".to_string(),
+            "archive=7zip; apt-cache show p7zip-full >/dev/null 2>&1 && archive=p7zip-full; DEBIAN_FRONTEND=noninteractive apt-get install -y wine wine64 winetricks cabextract wget curl \"$archive\" tar xz-utils pciutils unzip icoutils".to_string(),
         )
     };
     let steps = vec![
-        PackageStep::root(
-            "Enable the i386 architecture",
-            "dpkg --add-architecture i386",
-        ),
         PackageStep::root("Refresh package lists", "apt-get update"),
         PackageStep::root("Install Wine libraries and installer tools", install_script),
     ];
@@ -179,16 +157,10 @@ fn ubuntu_plan(os: &OsRelease) -> (String, Vec<PackageStep>) {
 fn fedora_plan() -> (String, Vec<PackageStep>) {
     (
         "fedora".to_string(),
-        vec![
-            PackageStep::root(
-                "Install Wine libraries and installer tools",
-                "dnf install -y wine winetricks cabextract wget curl p7zip p7zip-plugins tar xz pciutils unzip icoutils",
-            ),
-            PackageStep::root(
-                "Install the 32-bit Wine libraries",
-                "dnf install -y wine-core.i686",
-            ),
-        ],
+        vec![PackageStep::root(
+            "Install Wine libraries and installer tools",
+            "dnf install -y wine winetricks cabextract wget curl p7zip p7zip-plugins tar xz pciutils unzip icoutils",
+        )],
     )
 }
 
@@ -200,10 +172,6 @@ fn suse_plan() -> (String, Vec<PackageStep>) {
             PackageStep::root(
                 "Install Wine libraries and installer tools",
                 "zypper --non-interactive install -y wine winetricks cabextract wget curl 7zip tar xz pciutils unzip icoutils",
-            ),
-            PackageStep::root_optional(
-                "Install the 32-bit Wine libraries",
-                "zypper --non-interactive install -y wine-32bit",
             ),
         ],
     )
@@ -441,7 +409,7 @@ mod tests {
     use super::*;
 
     fn plan_for(text: &str) -> PackagePlan {
-        plan_with(&OsRelease::parse(text), Some(true), Some(false))
+        plan_with(&OsRelease::parse(text), Some(false))
     }
 
     fn scripts(plan: &PackagePlan) -> String {
@@ -453,26 +421,28 @@ mod tests {
     }
 
     #[test]
-    fn arch_plan_uses_pacman_and_multilib() {
+    fn arch_plan_uses_pacman_without_multilib() {
         let plan = plan_for("ID=cachyos\nID_LIKE=arch\n");
         assert_eq!(plan.family, Family::Arch);
-        assert!(scripts(&plan).contains("pacman -Syu"));
-        assert!(scripts(&plan).contains("winetricks"));
-        assert!(scripts(&plan).contains("cabextract"));
+        let scripts = scripts(&plan);
+        assert!(scripts.contains("pacman -Syu"));
+        assert!(scripts.contains("winetricks"));
+        assert!(scripts.contains("cabextract"));
+        assert!(scripts.contains("gnutls"));
+        assert!(scripts.contains("vulkan-icd-loader"));
+        assert!(!scripts.contains("multilib"));
+        assert!(!scripts.contains("lib32"));
         assert!(plan.notes.is_empty());
-
-        let plan = plan_with(&OsRelease::parse("ID=arch\n"), Some(false), Some(false));
-        assert!(plan.steps[0].script.contains("[multilib]"));
     }
 
     #[test]
-    fn ubuntu_plan_installs_both_architectures() {
+    fn ubuntu_plan_needs_no_i386() {
         let plan = plan_for("ID=ubuntu\nVERSION_ID=\"24.04\"\nID_LIKE=debian\n");
         assert_eq!(plan.flavor, "ubuntu-24.4");
         let scripts = scripts(&plan);
-        assert!(scripts.contains("dpkg --add-architecture i386"));
+        assert!(!scripts.contains("i386"));
         assert!(scripts.contains("DEBIAN_FRONTEND=noninteractive"));
-        assert!(scripts.contains("wine32:i386"));
+        assert!(scripts.contains("wine64"));
         assert!(scripts.contains("p7zip-full"));
         assert!(scripts.contains("cabextract"));
     }
@@ -486,10 +456,10 @@ mod tests {
     }
 
     #[test]
-    fn ubuntu_derivatives_probe_7zip() {
+    fn ubuntu_derivatives_prefer_p7zip_full() {
         let plan = plan_for("ID=linuxmint\nVERSION_ID=\"22.1\"\nID_LIKE=\"ubuntu debian\"\n");
         assert_eq!(plan.flavor, "linuxmint");
-        assert!(scripts(&plan).contains("apt-cache show 7zip"));
+        assert!(scripts(&plan).contains("apt-cache show p7zip-full"));
     }
 
     #[test]
@@ -497,12 +467,13 @@ mod tests {
         let fedora = plan_for("ID=fedora\n");
         assert!(scripts(&fedora).contains("dnf install"));
         assert!(scripts(&fedora).contains("p7zip-plugins"));
-        assert!(!fedora.steps[1].optional);
+        assert!(!scripts(&fedora).contains("i686"));
 
         let suse = plan_for("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
         assert!(scripts(&suse).contains("zypper --non-interactive refresh"));
         assert!(scripts(&suse).contains("zypper --non-interactive install"));
         assert!(scripts(&suse).contains("cabextract"));
+        assert!(!scripts(&suse).contains("32bit"));
     }
 
     #[test]
@@ -518,7 +489,6 @@ mod tests {
         let silverblue = plan_with(
             &OsRelease::parse("ID=fedora\nPRETTY_NAME=\"Fedora Silverblue\"\n"),
             Some(true),
-            Some(true),
         );
         assert!(silverblue.steps.is_empty());
         assert!(
@@ -531,7 +501,11 @@ mod tests {
 
     #[test]
     fn batched_pkexec_combines_steps() {
-        let plan = plan_for("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
+        let mut plan = plan_for("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
+        plan.steps.push(PackageStep {
+            optional: true,
+            ..PackageStep::root("Optional extra", "true")
+        });
         let script = batched_pkexec_script(&plan);
         assert!(script.contains("==> [1/3]"));
         assert!(script.contains("==> [3/3]"));

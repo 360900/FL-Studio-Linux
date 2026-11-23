@@ -652,7 +652,7 @@ mod tests {
         let mut lines = Vec::new();
         let report = install(&options(&prefix), |_, line| lines.push(line.to_string())).unwrap();
         let text = lines.join("\n");
-        assert!(text.contains("wine-11.22-amd64.tar.xz"));
+        assert!(text.contains("wine-11.22-amd64-wow64.tar.xz"));
         assert!(text.contains("FL Studio setup"));
         assert!(text.contains("corefonts"));
         assert!(text.contains("FL64.exe"));
