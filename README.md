@@ -122,9 +122,11 @@ diagnostics: `doctor`, `deps`, `wine-setup`.
 - FL Studio disables PipeWire's internal `PipeWire-System`,
   `PipeWire-RT-Event` and `Midi Through` inputs during install. If no hardware
   MIDI controller is connected, MIDI input is also turned off so FL does not
-  raise the PipeWire driver error at startup. Connect a controller and run
-  Repair to enable MIDI input again. With hardware present, the virtual ports
-  stay disabled but their `FAIL` labels can remain in the MIDI list.
+  raise the PipeWire driver error at startup. Turn it on in FL Studio's MIDI
+  settings once a controller is connected. With hardware present, the virtual
+  ports stay disabled but their `FAIL` labels can remain in the MIDI list.
+- These audio and MIDI defaults are only written when missing, so updates and
+  repairs keep the settings you changed in FL Studio.
 - FL Cloud, the Help pane and the Sounds tab are WebView2 pages. They need the
   Microsoft fonts and plugin runtimes installed by this app. If Image-Line's
   installer skips WebView2, the app downloads and installs Microsoft's

@@ -4,7 +4,8 @@
 //! `HKCU\\Software\\Image-Line\\FL Studio <major>\\Devices`. Writing the audio
 //! device before the first launch selects WinePipe. The PipeWire
 //! sequencer ports are disabled because Wine opens them as MIDI hardware and
-//! they always fail.
+//! they always fail. Every value is only written when it is missing, so
+//! updates and repairs keep the user's own settings.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,12 +99,12 @@ where
 
     // With no hardware controller, FL's input scan still opens the failing
     // PipeWire ports. Turning input off when there is no hardware keeps the
-    // startup clean; a later repair re-enables it once a controller appears.
+    // first startup clean; FL's MIDI settings turn it back on.
     let hardware = hardware_midi_present();
     report.info(if hardware {
-        "MIDI hardware found; leaving FL Studio MIDI input enabled"
+        "MIDI hardware found; FL Studio MIDI input defaults to on"
     } else {
-        "no MIDI hardware found; disabling FL Studio MIDI input"
+        "no MIDI hardware found; FL Studio MIDI input defaults to off"
     });
     reg_add(
         prefix,
@@ -213,7 +214,7 @@ fn clear_winepipe_device(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Write a default only when the value does not exist yet.
 fn reg_add(
     prefix: &Path,
     wine_dir: &Path,
@@ -224,13 +225,9 @@ fn reg_add(
     report: &mut Report<'_>,
 ) -> Result<()> {
     let wine_bin = wine_dir.join("bin/wine");
-    let mut cmd = Command::new(&wine_bin);
-    cmd.args([
-        "reg", "add", key, "/v", name, "/t", "REG_SZ", "/d", value, "/f",
-    ]);
     if dry_run {
         report.info(format!(
-            "    WINEPREFIX={} {} reg add {} /v '{}' /d '{}' /f",
+            "    WINEPREFIX={} {} reg add {} /v '{}' /d '{}' /f (if missing)",
             prefix.display(),
             wine_bin.display(),
             key,
@@ -239,6 +236,18 @@ fn reg_add(
         ));
         return Ok(());
     }
+    let mut query = Command::new(&wine_bin);
+    query.args(["reg", "query", key, "/v", name]);
+    let mut options = RunOptions::default().stall(Duration::from_secs(60)).quiet();
+    options.envs = wine::wine_env(prefix, wine_dir, "-all");
+    if runner::run(query, options, |stream, line| report.line(stream, line))?.success() {
+        return Ok(());
+    }
+
+    let mut cmd = Command::new(&wine_bin);
+    cmd.args([
+        "reg", "add", key, "/v", name, "/t", "REG_SZ", "/d", value, "/f",
+    ]);
     let mut options = RunOptions::default().stall(Duration::from_secs(60));
     options.envs = wine::wine_env(prefix, wine_dir, "-all");
     let result = runner::run(cmd, options, |stream, line| report.line(stream, line))?;
@@ -293,6 +302,7 @@ mod tests {
         assert!(text.contains("1WinePipe"));
         assert!(text.contains("PipeWire-System - input"));
         assert!(text.contains("/d '0'"));
+        assert!(text.contains("(if missing)"));
     }
 
     #[test]
