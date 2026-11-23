@@ -32,7 +32,8 @@ assets = [
     ["../../packaging/io.github._360900.FLStudioLinux.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../../README.md", "usr/share/doc/fl-studio-linux/", "644"],
     ["../../THIRD_PARTY_NOTICES.md", "usr/share/doc/fl-studio-linux/", "644"],
-    ["../../vendor/winepipe/LICENSE", "usr/share/licenses/fl-studio-linux/", "644"],
+    ["../../LICENSE", "usr/share/licenses/fl-studio-linux/LICENSE", "644"],
+    ["../../vendor/winepipe/LICENSE", "usr/share/licenses/fl-studio-linux/WinePipe-LICENSE", "644"],
 ]
 
 [package.metadata.generate-rpm]
