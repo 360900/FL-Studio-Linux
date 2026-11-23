@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Serialize;
@@ -42,15 +44,61 @@ pub struct Gpu {
     pub discrete: bool,
 }
 
-/// Detect display controllers via lspci. Returns an empty list if lspci is absent.
+/// Detect display controllers via lspci, or from sysfs when lspci is not
+/// installed (pciutils is missing on many minimal installs).
 pub fn detect() -> Vec<Gpu> {
-    let Ok(output) = Command::new("lspci").arg("-Dnn").output() else {
+    let from_lspci = Command::new("lspci")
+        .arg("-Dnn")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse(&String::from_utf8_lossy(&output.stdout)));
+    match from_lspci {
+        Some(gpus) if !gpus.is_empty() => gpus,
+        _ => from_sysfs(Path::new("/sys/bus/pci/devices")),
+    }
+}
+
+/// Display controllers (PCI class 0x03) under a sysfs devices folder. Names
+/// follow lspci's form for unknown devices, e.g. "NVIDIA Corporation Device 2484".
+fn from_sysfs(root: &Path) -> Vec<Gpu> {
+    let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse(&String::from_utf8_lossy(&output.stdout))
+    let read = |dir: &Path, name: &str| {
+        fs::read_to_string(dir.join(name))
+            .ok()
+            .map(|text| text.trim().trim_start_matches("0x").to_ascii_lowercase())
+    };
+    let mut gpus: Vec<Gpu> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            if !read(&dir, "class")?.starts_with("03") {
+                return None;
+            }
+            let vendor_id = read(&dir, "vendor")?;
+            let device_id = read(&dir, "device")?;
+            let vendor_name = match vendor_id.as_str() {
+                "10de" => "NVIDIA Corporation".to_string(),
+                "1002" => "Advanced Micro Devices, Inc. [AMD/ATI]".to_string(),
+                "8086" => "Intel Corporation".to_string(),
+                other => format!("Vendor {other}"),
+            };
+            let name = format!("{vendor_name} Device {device_id}");
+            let slot = entry.file_name().to_string_lossy().into_owned();
+            let vendor = classify(&name);
+            Some(Gpu {
+                discrete: is_discrete(vendor, &name, &slot),
+                pci_id: Some(format!("{vendor_id}:{device_id}")),
+                vendor,
+                name,
+                slot,
+            })
+        })
+        .collect();
+    gpus.sort_by(|a, b| a.slot.cmp(&b.slot));
+    gpus
 }
 
 pub fn parse(text: &str) -> Vec<Gpu> {
@@ -236,6 +284,29 @@ mod tests {
         );
         assert!(!arc[0].discrete);
         assert!(arc[1].discrete);
+    }
+
+    #[test]
+    fn reads_gpus_from_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = |slot: &str, class: &str, vendor: &str, id: &str| {
+            let path = dir.path().join(slot);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("class"), format!("{class}\n")).unwrap();
+            fs::write(path.join("vendor"), format!("{vendor}\n")).unwrap();
+            fs::write(path.join("device"), format!("{id}\n")).unwrap();
+        };
+        device("0000:01:00.0", "0x030000", "0x10de", "0x2484");
+        device("0000:00:02.0", "0x030000", "0x8086", "0xA7A0");
+        device("0000:00:1f.3", "0x040300", "0x8086", "0x51ca");
+        let gpus = from_sysfs(dir.path());
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].vendor, Vendor::Intel);
+        assert!(!gpus[0].discrete);
+        assert_eq!(gpus[0].pci_id.as_deref(), Some("8086:a7a0"));
+        assert_eq!(gpus[1].vendor, Vendor::Nvidia);
+        assert_eq!(gpus[1].name, "NVIDIA Corporation Device 2484");
+        assert!(gpus[1].discrete);
     }
 
     #[test]

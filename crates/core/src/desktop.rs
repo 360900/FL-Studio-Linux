@@ -78,6 +78,16 @@ where
             let shortcut = desktop_folder.join("FL Studio.desktop");
             if fs::copy(&desktop, &shortcut).is_ok() {
                 let _ = fs::set_permissions(&shortcut, fs::Permissions::from_mode(0o755));
+                // GNOME's desktop icons only launch shortcuts marked trusted.
+                if which("gio").is_some() {
+                    let _ = Command::new("gio")
+                        .args(["set"])
+                        .arg(&shortcut)
+                        .args(["metadata::trusted", "true"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
             }
         }
     }
