@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::desktop::{self, DESKTOP_FILE, ICON_FILE, MIME_FILE, URL_HANDLER_FILE};
+use crate::desktop::{self, DESKTOP_FILE, MIME_FILE, URL_HANDLER_FILE};
 use crate::journal::Report;
 use crate::runner::{self, RunOptions, Stream};
 use crate::{WINE_DIR_NAME, config, wine};
@@ -265,7 +265,11 @@ fn owned_paths(prefixes: &[PathBuf], report: &mut Report<'_>) -> Vec<PathBuf> {
         }
     }
     if owned {
-        paths.push(data.join("icons/hicolor/scalable/apps").join(ICON_FILE));
+        paths.extend(
+            desktop::icon_paths(&data)
+                .into_iter()
+                .filter(|path| path.symlink_metadata().is_ok()),
+        );
         paths.push(data.join("mime/packages").join(MIME_FILE));
     }
     paths

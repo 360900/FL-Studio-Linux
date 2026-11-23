@@ -1,12 +1,16 @@
 //! Application menu entry, FLP association and `flstudio://` handler.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use ico::{IconDir, IconImage};
+use pelite::PeFile;
 
 use crate::deps::which;
 use crate::journal::Report;
@@ -16,8 +20,11 @@ use crate::{LAUNCHER_NAME, WINE_DIR_NAME, app_exe, to_windows_path, wine};
 pub const DESKTOP_FILE: &str = "fl-studio.desktop";
 pub const URL_HANDLER_FILE: &str = "fl-studio-url.desktop";
 pub const MIME_FILE: &str = "fl-studio.xml";
-pub const ICON_FILE: &str = "fl-studio.svg";
+pub const ICON_NAME: &str = "fl-studio";
+/// Used when FL Studio's own icon cannot be read from its executable.
 const ICON_SVG: &str = include_str!("../../../packaging/fl-studio-linux.svg");
+/// Sizes with a fixed directory in the hicolor theme.
+const ICON_SIZES: [u32; 13] = [16, 22, 24, 32, 36, 48, 64, 72, 96, 128, 192, 256, 512];
 const SCHEME_TYPES: &str = "x-scheme-handler/flstudio;x-scheme-handler/fl-cloud-plugins;";
 
 #[derive(Debug, Clone)]
@@ -45,7 +52,8 @@ where
     let applications = applications_dir()?;
     let desktop = applications.join(DESKTOP_FILE);
     let url_desktop = applications.join(URL_HANDLER_FILE);
-    let icon = icons_dir()?.join(ICON_FILE);
+    let icon_theme = icon_theme_dir()?;
+    let mut icon = scalable_icon(&icon_theme);
     let mime = mime_packages_dir()?.join(MIME_FILE);
     let exec = exec_line(&opts.prefix);
     let contents = desktop_contents(&opts.prefix, &exec);
@@ -56,7 +64,7 @@ where
         report.info(format!("    {}", contents.replace('\n', "\n    ")));
         report.info(format!("    url handler: {}", url_desktop.display()));
         report.info(format!("    {}", url_contents.replace('\n', "\n    ")));
-        report.info(format!("    icon: {}", icon.display()));
+        report.info("    icon: extracted from FL64.exe, or the bundled icon if that fails");
         report.info(format!("    mime: {}", mime.display()));
     } else {
         if app_exe(&opts.prefix).is_none() {
@@ -69,8 +77,7 @@ where
         fs::write(&desktop, &contents).with_context(|| format!("writing {}", desktop.display()))?;
         fs::write(&url_desktop, &url_contents)
             .with_context(|| format!("writing {}", url_desktop.display()))?;
-        fs::create_dir_all(icon.parent().context("icon directory")?)?;
-        fs::write(&icon, ICON_SVG).with_context(|| format!("writing {}", icon.display()))?;
+        icon = install_icon(&opts.prefix, &icon_theme, &mut report)?;
         fs::create_dir_all(mime.parent().context("mime directory")?)?;
         fs::write(&mime, mime_xml()).with_context(|| format!("writing {}", mime.display()))?;
 
@@ -111,6 +118,111 @@ where
     })
 }
 
+/// Installs FL Studio's own icon from its executable, falling back to the
+/// bundled one. Icons left by the other source are removed so they cannot win
+/// the theme lookup. Returns the largest icon written.
+fn install_icon(prefix: &Path, theme: &Path, report: &mut Report<'_>) -> Result<PathBuf> {
+    let extracted = app_exe(prefix)
+        .context("FL Studio is not installed")
+        .and_then(|exe| exe_icons(&exe));
+    match extracted {
+        Ok(icons) => {
+            let mut largest = None;
+            for (size, png) in &icons {
+                let path = sized_icon(theme, *size);
+                fs::create_dir_all(path.parent().context("icon directory")?)?;
+                fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
+                largest = Some(path);
+            }
+            for size in ICON_SIZES.iter().filter(|size| !icons.contains_key(size)) {
+                remove_icon(&sized_icon(theme, *size));
+            }
+            remove_icon(&scalable_icon(theme));
+            report.info(format!("icon: FL Studio's own, {} sizes", icons.len()));
+            largest.context("no icon written")
+        }
+        Err(error) => {
+            report.warn(format!(
+                "could not read FL Studio's icon ({error:#}); using the bundled one"
+            ));
+            let path = scalable_icon(theme);
+            fs::create_dir_all(path.parent().context("icon directory")?)?;
+            fs::write(&path, ICON_SVG).with_context(|| format!("writing {}", path.display()))?;
+            for size in ICON_SIZES {
+                remove_icon(&sized_icon(theme, size));
+            }
+            Ok(path)
+        }
+    }
+}
+
+fn remove_icon(path: &Path) {
+    if path.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// The application icon of a Windows executable as PNGs keyed by size. Only
+/// square images with a hicolor size are kept, the deepest one per size.
+fn exe_icons(exe: &Path) -> Result<BTreeMap<u32, Vec<u8>>> {
+    let bytes = fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let pe = PeFile::from_bytes(&bytes).context("not a Windows executable")?;
+    let resources = pe.resources().context("no resources")?;
+    // Windows shows the first icon group as the program's icon.
+    let (_, group) = resources
+        .icons()
+        .find_map(|icon| icon.ok())
+        .context("no icon")?;
+    let mut best: BTreeMap<u32, (u16, IconImage)> = BTreeMap::new();
+    for entry in group.entries() {
+        let Ok(image) = group
+            .image(entry.nId)
+            .map_err(|_| ())
+            .and_then(|data| decode_icon(data).map_err(|_| ()))
+        else {
+            continue;
+        };
+        let size = image.width();
+        if image.height() != size || !ICON_SIZES.contains(&size) {
+            continue;
+        }
+        if best
+            .get(&size)
+            .is_none_or(|(depth, _)| entry.wBitCount > *depth)
+        {
+            best.insert(size, (entry.wBitCount, image));
+        }
+    }
+    if best.is_empty() {
+        bail!("no usable icon size");
+    }
+    best.into_iter()
+        .map(|(size, (_, image))| {
+            let mut png = Vec::new();
+            image.write_png(&mut png)?;
+            Ok((size, png))
+        })
+        .collect()
+}
+
+/// Decodes one icon image, stored either as a PNG or as a bare bitmap.
+fn decode_icon(data: &[u8]) -> std::io::Result<IconImage> {
+    if data.starts_with(b"\x89PNG") {
+        return IconImage::read_png(Cursor::new(data));
+    }
+    // Wrap the bitmap in a one-image ICO file so the ico crate can decode it.
+    // The size fields are placeholders; it reads the real size from the bitmap.
+    let mut file = Vec::with_capacity(22 + data.len());
+    file.extend_from_slice(&[0, 0, 1, 0, 1, 0]);
+    file.extend_from_slice(&[0, 0, 0, 0]);
+    file.extend_from_slice(&1u16.to_le_bytes());
+    file.extend_from_slice(&32u16.to_le_bytes());
+    file.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+    file.extend_from_slice(&22u32.to_le_bytes());
+    file.extend_from_slice(data);
+    IconDir::read(Cursor::new(file))?.entries()[0].decode()
+}
+
 fn desktop_contents(prefix: &Path, exec: &str) -> String {
     let path_value = escape_desktop_string(&prefix.display().to_string());
     format!(
@@ -119,7 +231,7 @@ fn desktop_contents(prefix: &Path, exec: &str) -> String {
          Name=FL Studio\n\
          GenericName=Digital Audio Workstation\n\
          Comment=Windows FL Studio running through Wine\n\
-         Icon=fl-studio\n\
+         Icon={ICON_NAME}\n\
          Path={path_value}\n\
          Exec={exec} %F\n\
          Terminal=false\n\
@@ -407,8 +519,26 @@ fn applications_dir() -> Result<PathBuf> {
     Ok(xdg_data_home()?.join("applications"))
 }
 
-fn icons_dir() -> Result<PathBuf> {
-    Ok(xdg_data_home()?.join("icons/hicolor/scalable/apps"))
+fn icon_theme_dir() -> Result<PathBuf> {
+    Ok(xdg_data_home()?.join("icons/hicolor"))
+}
+
+fn scalable_icon(theme: &Path) -> PathBuf {
+    theme.join("scalable/apps").join(format!("{ICON_NAME}.svg"))
+}
+
+fn sized_icon(theme: &Path, size: u32) -> PathBuf {
+    theme
+        .join(format!("{size}x{size}/apps"))
+        .join(format!("{ICON_NAME}.png"))
+}
+
+/// Every icon file `create` may have written under a data directory.
+pub(crate) fn icon_paths(data: &Path) -> Vec<PathBuf> {
+    let theme = data.join("icons/hicolor");
+    let mut paths = vec![scalable_icon(&theme)];
+    paths.extend(ICON_SIZES.iter().map(|size| sized_icon(&theme, *size)));
+    paths
 }
 
 fn mime_root() -> Result<PathBuf> {
@@ -625,6 +755,58 @@ mod tests {
                 .unwrap()
                 .contains("NoDisplay=true")
         );
+    }
+
+    #[test]
+    fn decodes_png_and_bitmap_icons() {
+        let mut image = IconImage::from_rgba_data(32, 32, vec![0; 32 * 32 * 4]);
+        image.rgba_data_mut()[..4].copy_from_slice(&[255, 120, 0, 255]);
+        let png = ico::IconDirEntry::encode_as_png(&image).unwrap();
+        let bmp = ico::IconDirEntry::encode_as_bmp(&image).unwrap();
+        for data in [png.data(), bmp.data()] {
+            let decoded = decode_icon(data).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (32, 32));
+            assert_eq!(decoded.rgba_data(), image.rgba_data());
+        }
+    }
+
+    #[test]
+    fn non_executables_have_no_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("FL64.exe");
+        fs::write(&exe, b"not a PE file").unwrap();
+        assert!(exe_icons(&exe).is_err());
+    }
+
+    #[test]
+    fn falls_back_to_the_bundled_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::app_dir(dir.path()).join("FL Studio 2026");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("FL64.exe"), b"exe").unwrap();
+        let theme = dir.path().join("icons/hicolor");
+        let stale = sized_icon(&theme, 48);
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"png").unwrap();
+        let mut lines = Vec::new();
+        let mut sink = |_, line: &str| lines.push(line.to_string());
+        let mut report = Report::new(None, &mut sink);
+        let icon = install_icon(dir.path(), &theme, &mut report).unwrap();
+        assert_eq!(icon, scalable_icon(&theme));
+        assert_eq!(fs::read_to_string(&icon).unwrap(), ICON_SVG);
+        assert!(!stale.exists());
+        assert!(lines.iter().any(|line| line.contains("bundled")));
+    }
+
+    #[test]
+    fn icon_paths_cover_every_size() {
+        let paths = icon_paths(Path::new("/data"));
+        assert!(paths.contains(&PathBuf::from(
+            "/data/icons/hicolor/scalable/apps/fl-studio.svg"
+        )));
+        assert!(paths.contains(&PathBuf::from(
+            "/data/icons/hicolor/256x256/apps/fl-studio.png"
+        )));
     }
 
     #[test]
