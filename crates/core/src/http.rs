@@ -380,6 +380,16 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
         assert!(lock_download(&path, Some(&cancel)).is_err());
         drop(held);
+        // A process another test spawns at this moment briefly shares the
+        // descriptor, so the lock can outlive `drop`; wait like real callers.
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(5));
+                cancel.store(true, Ordering::Relaxed);
+            });
+        }
         assert!(lock_download(&path, Some(&cancel)).is_ok());
     }
 }
