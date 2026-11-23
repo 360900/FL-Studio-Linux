@@ -41,33 +41,51 @@ where
     let mut outcome = UninstallOutcome::default();
 
     config::validate_prefix(&opts.prefix)?;
-    if !opts.dry_run && opts.prefix.exists() && !config::looks_like_prefix(&opts.prefix) {
+    // A symlinked prefix: delete what it points to as well as the link.
+    let is_link = opts
+        .prefix
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    let target = if is_link {
+        let target = link_target(&opts.prefix)?;
+        config::validate_prefix(&target)?;
+        target
+    } else {
+        opts.prefix.clone()
+    };
+    if !opts.dry_run && target.exists() && !config::looks_like_prefix(&target) {
         bail!(
             "{} does not look like a Wine prefix; refusing to delete it",
-            opts.prefix.display()
+            target.display()
         );
     }
+    let prefixes = [opts.prefix.clone(), target.clone()];
+    let staging = staging_path(&target)?;
     report.info(format!(
         "Uninstalling FL Studio from {}",
         opts.prefix.display()
     ));
 
+    let paths = owned_paths(&prefixes, &mut report);
     if opts.dry_run {
-        for path in removal_paths() {
+        for path in &paths {
             report.info(format!("would remove {}", path.display()));
         }
-        report.info("would remove FL Studio entries created by Wine");
-        if opts.prefix.exists() {
-            report.info(format!("would run rm -rf {}", opts.prefix.display()));
+        report.info("would remove FL Studio entries Wine created for this prefix");
+        if target.exists() {
+            report.info(format!("would run rm -rf {}", target.display()));
         } else {
-            report.info(format!("{} does not exist", opts.prefix.display()));
+            report.info(format!("{} does not exist", target.display()));
+        }
+        if is_link {
+            report.info(format!("would remove the link {}", opts.prefix.display()));
         }
         return Ok(outcome);
     }
 
     stop_prefix(&opts.prefix, &mut report);
 
-    for path in removal_paths() {
+    for path in paths {
         let Ok(metadata) = path.symlink_metadata() else {
             continue;
         };
@@ -86,41 +104,82 @@ where
             }
         }
     }
-    outcome.removed_entries += remove_fl_wine_entries(&mut report);
+    outcome.removed_entries += remove_fl_wine_entries(&prefixes, &mut report);
     if outcome.removed_entries > 0 {
         refresh_databases(&mut report);
     }
 
-    if opts.prefix.exists() {
-        report.info(format!("deleting {}", opts.prefix.display()));
-        if let Err(error) = fs::remove_dir_all(&opts.prefix) {
-            report.warn(format!(
-                "initial removal failed ({error}); retrying after chmod"
-            ));
-            make_writable(&opts.prefix);
-            if fs::remove_dir_all(&opts.prefix).is_err() {
-                report.warn("retry failed; falling back to rm -rf");
-                let _ = Command::new("rm")
-                    .args(["-rf", "--"])
-                    .arg(&opts.prefix)
-                    .status()
-                    .context("running rm -rf")?;
-            }
-        }
-        if opts.prefix.exists() {
-            bail!(
-                "could not delete {}; close FL Studio and any Wine processes, then retry",
-                opts.prefix.display()
-            );
+    // An earlier uninstall that was interrupted while deleting.
+    if staging.exists() {
+        report.info(format!("finishing the removal of {}", staging.display()));
+        remove_tree(&staging, &mut report)?;
+    }
+    if target.exists() {
+        report.info(format!("deleting {}", target.display()));
+        // Move the prefix aside first: an interrupted delete then leaves
+        // only the staging folder, which the next run finishes.
+        if fs::rename(&target, &staging).is_ok() {
+            remove_tree(&staging, &mut report)?;
+        } else {
+            remove_tree(&target, &mut report)?;
         }
         outcome.prefix_removed = true;
         report.info("prefix deleted");
     } else {
         report.info("prefix not found; nothing to delete");
     }
+    if is_link && fs::remove_file(&opts.prefix).is_ok() {
+        report.info(format!("removed the link {}", opts.prefix.display()));
+    }
 
     report.info("FL Studio projects and samples outside the prefix were kept");
     Ok(outcome)
+}
+
+/// Where a symlinked prefix points, also when the target no longer exists.
+fn link_target(link: &Path) -> Result<PathBuf> {
+    let target = fs::read_link(link).with_context(|| format!("reading {}", link.display()))?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        link.parent().unwrap_or(Path::new("/")).join(target)
+    };
+    Ok(target.canonicalize().unwrap_or(target))
+}
+
+/// `.<name>.removing` next to the prefix.
+fn staging_path(prefix: &Path) -> Result<PathBuf> {
+    let name = prefix
+        .file_name()
+        .with_context(|| format!("{} has no folder name", prefix.display()))?;
+    let mut staging = std::ffi::OsString::from(".");
+    staging.push(name);
+    staging.push(".removing");
+    Ok(prefix.with_file_name(staging))
+}
+
+fn remove_tree(path: &Path, report: &mut Report<'_>) -> Result<()> {
+    if let Err(error) = fs::remove_dir_all(path) {
+        report.warn(format!(
+            "initial removal failed ({error}); retrying after chmod"
+        ));
+        make_writable(path);
+        if fs::remove_dir_all(path).is_err() {
+            report.warn("retry failed; falling back to rm -rf");
+            let _ = Command::new("rm")
+                .args(["-rf", "--"])
+                .arg(path)
+                .status()
+                .context("running rm -rf")?;
+        }
+    }
+    if path.exists() {
+        bail!(
+            "could not delete {}; close FL Studio and any Wine processes, then retry",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn stop_prefix(prefix: &Path, report: &mut Report<'_>) {
@@ -173,37 +232,80 @@ fn make_writable(path: &Path) {
     }
 }
 
-fn removal_paths() -> Vec<PathBuf> {
+/// Menu entries, handlers, icon and MIME type that belong to this prefix.
+/// Files that launch another prefix, e.g. after an install elsewhere, stay.
+fn owned_paths(prefixes: &[PathBuf], report: &mut Report<'_>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let Some(data) = xdg_data_home() else {
         return paths;
     };
     let applications = data.join("applications");
-    paths.push(applications.join(DESKTOP_FILE));
-    paths.push(applications.join(URL_HANDLER_FILE));
-    paths.push(applications.join("wine-protocol-flstudio.desktop"));
-    paths.push(applications.join("wine-protocol-fl-cloud-plugins.desktop"));
-    paths.push(data.join("icons/hicolor/scalable/apps").join(ICON_FILE));
-    paths.push(data.join("mime/packages").join(MIME_FILE));
+    let launcher = applications.join(DESKTOP_FILE);
+    let owned = !launcher.exists() || file_references(&launcher, prefixes);
+    let mut candidates = vec![
+        applications.join(DESKTOP_FILE),
+        applications.join(URL_HANDLER_FILE),
+        applications.join("wine-protocol-flstudio.desktop"),
+        applications.join("wine-protocol-fl-cloud-plugins.desktop"),
+    ];
     if let Some(desktop) = desktop::desktop_dir() {
-        paths.push(desktop.join("FL Studio.desktop"));
+        candidates.push(desktop.join("FL Studio.desktop"));
+    }
+    for path in candidates {
+        if path.symlink_metadata().is_err() {
+            continue;
+        }
+        if file_references(&path, prefixes) {
+            paths.push(path);
+        } else {
+            report.info(format!(
+                "keeping {}: it launches another prefix",
+                path.display()
+            ));
+        }
+    }
+    if owned {
+        paths.push(data.join("icons/hicolor/scalable/apps").join(ICON_FILE));
+        paths.push(data.join("mime/packages").join(MIME_FILE));
     }
     paths
 }
 
-/// Remove only FL Studio entries from Wine's menu folder, leaving other
-/// Image-Line applications alone.
-fn remove_fl_wine_entries(report: &mut Report<'_>) -> usize {
+/// True when a desktop file's text names one of the prefixes.
+fn file_references(path: &Path, prefixes: &[PathBuf]) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| references(&text, prefixes))
+}
+
+/// The prefix path appears as a whole path, not as the start of a longer one.
+pub(crate) fn references(text: &str, prefixes: &[PathBuf]) -> bool {
+    prefixes
+        .iter()
+        .filter_map(|prefix| prefix.to_str())
+        .any(|prefix| {
+            let prefix = prefix.trim_end_matches('/');
+            !prefix.is_empty()
+                && text.match_indices(prefix).any(|(index, _)| {
+                    text[index + prefix.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| matches!(next, '"' | '\'' | ' ' | '/' | '\n' | '\t'))
+                })
+        })
+}
+
+/// Remove this prefix's FL Studio entries from Wine's menu folder, leaving
+/// other Image-Line applications and other prefixes alone.
+fn remove_fl_wine_entries(prefixes: &[PathBuf], report: &mut Report<'_>) -> usize {
     let Some(data) = xdg_data_home() else {
         return 0;
     };
     let root = data.join("applications/wine/Programs/Image-Line");
-    let removed = remove_fl_entries_in(&root, report);
+    let removed = remove_fl_entries_in(&root, prefixes, report);
     prune_empty_dirs(&root);
     removed
 }
 
-fn remove_fl_entries_in(dir: &Path, report: &mut Report<'_>) -> usize {
+fn remove_fl_entries_in(dir: &Path, prefixes: &[PathBuf], report: &mut Report<'_>) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
@@ -211,11 +313,12 @@ fn remove_fl_entries_in(dir: &Path, report: &mut Report<'_>) -> usize {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            removed += remove_fl_entries_in(&path, report);
+            removed += remove_fl_entries_in(&path, prefixes, report);
         } else if path.extension().is_some_and(|ext| ext == "desktop") {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let lower = text.to_ascii_lowercase();
             if (path.to_string_lossy().contains("FL Studio") || lower.contains("name=fl studio"))
+                && references(&text, prefixes)
                 && fs::remove_file(&path).is_ok()
             {
                 removed += 1;
@@ -253,10 +356,7 @@ fn mime_dir() -> Option<PathBuf> {
 }
 
 fn xdg_data_home() -> Option<PathBuf> {
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
-        _ => Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share")),
-    }
+    Some(config::data_home())
 }
 
 #[cfg(test)]
@@ -280,7 +380,76 @@ mod tests {
         assert!(prefix.join("marker").exists());
         let text = lines.join("\n");
         assert!(text.contains("would run rm -rf"));
-        assert!(text.contains(DESKTOP_FILE));
+    }
+
+    #[test]
+    fn matches_whole_prefix_paths_only() {
+        let prefixes = [PathBuf::from("/home/me/FL")];
+        assert!(references(
+            "Exec=env WINEPREFIX=\"/home/me/FL\" wine",
+            &prefixes
+        ));
+        assert!(references(
+            "Exec=/usr/bin/fl-studio-linux launch --prefix /home/me/FL %F",
+            &prefixes
+        ));
+        assert!(references("Path=/home/me/FL\n", &prefixes));
+        assert!(!references(
+            "Exec=env WINEPREFIX=\"/home/me/FL2\" wine",
+            &prefixes
+        ));
+        assert!(!references(
+            "Exec=env WINEPREFIX=\"/home/me/.wine\" wine",
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn deletes_the_target_of_a_symlinked_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        fs::create_dir_all(target.join("drive_c")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let opts = UninstallOptions {
+            prefix: link.clone(),
+            dry_run: false,
+            log_path: None,
+        };
+        let outcome = uninstall(&opts, |_, _| {}).unwrap();
+        assert!(outcome.prefix_removed);
+        assert!(!target.exists());
+        assert!(link.symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn finishes_an_interrupted_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix");
+        let staging = staging_path(&prefix).unwrap();
+        assert_eq!(staging, dir.path().join(".prefix.removing"));
+        fs::create_dir_all(staging.join("drive_c/windows")).unwrap();
+        let opts = UninstallOptions {
+            prefix,
+            dry_run: false,
+            log_path: None,
+        };
+        uninstall(&opts, |_, _| {}).unwrap();
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn refuses_folders_that_are_not_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let games = dir.path().join("Games");
+        fs::create_dir_all(games.join("wine-ge-8-26")).unwrap();
+        let opts = UninstallOptions {
+            prefix: games.clone(),
+            dry_run: false,
+            log_path: None,
+        };
+        assert!(uninstall(&opts, |_, _| {}).is_err());
+        assert!(games.join("wine-ge-8-26").is_dir());
     }
 
     #[test]

@@ -98,16 +98,26 @@ impl Manifest {
         Ok(Some(manifest))
     }
 
+    /// Load the manifest, or start a new one. A file that no longer parses is
+    /// kept next to it as `.broken` instead of blocking every later step.
     pub fn load_or_new(prefix: &Path) -> Result<Self> {
-        Ok(Self::load(prefix)?.unwrap_or_default())
+        match Self::load(prefix) {
+            Ok(manifest) => Ok(manifest.unwrap_or_default()),
+            Err(_) if Self::path(prefix).is_file() => {
+                let path = Self::path(prefix);
+                let _ = fs::rename(&path, path.with_extension("json.broken"));
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn save(&mut self, prefix: &Path) -> Result<()> {
         self.updated_at = now_epoch();
-        fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
         let path = Self::path(prefix);
         let text = serde_json::to_string_pretty(self).context("serializing manifest")?;
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+        crate::config::write_atomic(&path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn mark(&mut self, step: &str, status: StepStatus, detail: Option<String>) {
@@ -169,6 +179,16 @@ mod tests {
         assert!(loaded.is_done(STEP_WINE));
         assert_eq!(loaded.incomplete_steps().len(), ALL_STEPS.len() - 2);
         assert_eq!(loaded.fl_exe.as_deref(), Some("/x/FL64.exe"));
+    }
+
+    #[test]
+    fn a_broken_manifest_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Manifest::path(dir.path());
+        fs::write(&path, b"{\"schema\": 1, \"app\"").unwrap();
+        let manifest = Manifest::load_or_new(dir.path()).unwrap();
+        assert!(manifest.steps.is_empty());
+        assert!(path.with_extension("json.broken").is_file());
     }
 
     #[test]

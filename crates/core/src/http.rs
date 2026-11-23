@@ -27,19 +27,10 @@ const CURL_DOWNLOAD: &[&str] = &[
     USER_AGENT,
 ];
 
-/// `$XDG_CACHE_HOME`, else `~/.cache`.
-pub(crate) fn xdg_cache_home() -> Result<PathBuf> {
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(cache));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cache"))
-}
-
 /// Large downloads kept outside the prefix, so a reinstall or a new prefix
 /// does not fetch them again.
 pub fn cache_dir() -> Result<PathBuf> {
-    Ok(xdg_cache_home()?.join(crate::APP_NAME))
+    Ok(crate::config::cache_home().join(crate::APP_NAME))
 }
 
 fn file_lock(path: &Path) -> Arc<Mutex<()>> {

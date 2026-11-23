@@ -85,7 +85,7 @@ where
     let registered = if opts.dry_run {
         register_protocol(opts, &mut report)?
     } else {
-        hide_wine_entries(&applications, &mut report);
+        hide_wine_entries(&applications, &opts.prefix, &mut report);
         refresh_databases(&applications, &mut report);
         let registered = register_protocol(opts, &mut report)?;
         refresh_databases(&applications, &mut report);
@@ -319,9 +319,10 @@ fn register_protocol(opts: &DesktopOptions, report: &mut Report<'_>) -> Result<b
 }
 
 /// Wine is told not to create menu entries, but older installs may have left
-/// some behind. Hide them so the menu does not offer a launcher that bypasses
-/// our environment.
-fn hide_wine_entries(applications: &Path, report: &mut Report<'_>) {
+/// some behind. Hide this prefix's ones so the menu does not offer a launcher
+/// that bypasses our environment; other prefixes' entries stay as they are.
+fn hide_wine_entries(applications: &Path, prefix: &Path, report: &mut Report<'_>) {
+    let prefixes = [prefix.to_path_buf()];
     let roots = [
         applications.join("wine/Programs/Image-Line"),
         applications.join("wine-protocol-flstudio.desktop"),
@@ -329,32 +330,34 @@ fn hide_wine_entries(applications: &Path, report: &mut Report<'_>) {
     ];
     for root in roots {
         if root.is_file() {
-            hide_entry(&root, report);
+            hide_entry(&root, &prefixes, report);
         } else if root.is_dir() {
-            hide_dir(&root, report);
+            hide_dir(&root, &prefixes, report);
         }
     }
 }
 
-fn hide_dir(dir: &Path, report: &mut Report<'_>) {
+fn hide_dir(dir: &Path, prefixes: &[PathBuf], report: &mut Report<'_>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            hide_dir(&path, report);
+            hide_dir(&path, prefixes, report);
         } else if path.extension().is_some_and(|ext| ext == "desktop") {
-            hide_entry(&path, report);
+            hide_entry(&path, prefixes, report);
         }
     }
 }
 
-fn hide_entry(path: &Path, report: &mut Report<'_>) {
+fn hide_entry(path: &Path, prefixes: &[PathBuf], report: &mut Report<'_>) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    if text.lines().any(|line| line.trim() == "NoDisplay=true") {
+    if !crate::uninstall::references(&text, prefixes)
+        || text.lines().any(|line| line.trim() == "NoDisplay=true")
+    {
         return;
     }
     let mut text = text;
@@ -407,10 +410,7 @@ fn mime_packages_dir() -> Result<PathBuf> {
 }
 
 fn xdg_data_home() -> Result<PathBuf> {
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
-        _ => Ok(home_dir()?.join(".local/share")),
-    }
+    Ok(crate::config::data_home())
 }
 
 /// Resolve the user's desktop directory via XDG user-dirs, falling back to `~/Desktop`.
@@ -428,10 +428,7 @@ pub(crate) fn desktop_dir() -> Option<PathBuf> {
         }
     }
     let home = home_dir().ok()?;
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
+    let config_home = crate::config::config_home();
     if let Ok(text) = fs::read_to_string(config_home.join("user-dirs.dirs"))
         && let Some(dir) = parse_user_dir(&text, "XDG_DESKTOP_DIR", &home)
     {
@@ -464,9 +461,7 @@ fn parse_user_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")
+    Ok(crate::config::home_dir())
 }
 
 /// Escape a `.desktop` string value (general string escaping).
@@ -591,13 +586,35 @@ mod tests {
         let applications = dir.path().join("applications");
         let entry = applications.join("wine/Programs/Image-Line/FL Studio/FL Studio.desktop");
         fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        fs::write(&entry, "[Desktop Entry]\nName=FL Studio\n").unwrap();
+        fs::write(
+            &entry,
+            "[Desktop Entry]\nName=FL Studio\nExec=env WINEPREFIX=\"/home/me/.FLStudioLinux\" wine FL64.exe\n",
+        )
+        .unwrap();
+        let other = applications.join("wine/Programs/Image-Line/FL Studio/Other.desktop");
+        fs::write(
+            &other,
+            "[Desktop Entry]\nName=FL Studio\nExec=env WINEPREFIX=\"/home/me/Bottles/FL\" wine FL64.exe\n",
+        )
+        .unwrap();
         let mut lines = Vec::new();
         let mut sink = |_, line: &str| lines.push(line.to_string());
         let mut report = Report::new(None, &mut sink);
-        hide_wine_entries(&applications, &mut report);
-        let text = fs::read_to_string(&entry).unwrap();
-        assert!(text.contains("NoDisplay=true"));
+        hide_wine_entries(
+            &applications,
+            Path::new("/home/me/.FLStudioLinux"),
+            &mut report,
+        );
+        assert!(
+            fs::read_to_string(&entry)
+                .unwrap()
+                .contains("NoDisplay=true")
+        );
+        assert!(
+            !fs::read_to_string(&other)
+                .unwrap()
+                .contains("NoDisplay=true")
+        );
     }
 
     #[test]
