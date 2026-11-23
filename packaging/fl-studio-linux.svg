@@ -10,18 +10,13 @@
       <stop offset="0" stop-color="#ffffff"/>
       <stop offset="1" stop-color="#c0bfbc"/>
     </linearGradient>
-    <clipPath id="bowl">
-      <path d="M28 12 H100 C103 42 92 70 64 76 C36 70 25 42 28 12 Z"/>
-    </clipPath>
   </defs>
   <ellipse cx="64" cy="110" rx="31" ry="8.5" fill="#5e5c64"/>
   <ellipse cx="64" cy="106" rx="30" ry="8" fill="url(#glass)" stroke="#77767b" stroke-width="2"/>
   <path d="M57 74 H71 V104 H57 Z" fill="url(#glass)" stroke="#77767b" stroke-width="2"/>
   <path d="M28 12 H100 C103 42 92 70 64 76 C36 70 25 42 28 12 Z" fill="url(#glass)"/>
-  <g clip-path="url(#bowl)">
-    <path d="M20 42 C30 30 40 30 50 42 S70 54 80 42 S100 30 110 42 V90 H20 Z" fill="url(#liquid)"/>
-    <path d="M20 42 C30 30 40 30 50 42 S70 54 80 42 S100 30 110 42" fill="none" stroke="#ffbe6f" stroke-width="3"/>
-    <path d="M38 22 C38 40 42 54 50 62" fill="none" stroke="#ffffff" stroke-opacity=".7" stroke-width="5" stroke-linecap="round"/>
-  </g>
+  <path d="M29.18 38 C36.18 31 40 30 50 42 S70 54 80 42 C90 30 91.82 31 98.82 38 C94.84 56.86 83.57 71.81 64 76 C44.43 71.81 33.16 56.86 29.18 38 Z" fill="url(#liquid)"/>
+  <path d="M29.18 38 C36.18 31 40 30 50 42 S70 54 80 42 C90 30 91.82 31 98.82 38" fill="none" stroke="#ffbe6f" stroke-width="3"/>
+  <path d="M38 22 C38 40 42 54 50 62" fill="none" stroke="#ffffff" stroke-opacity=".7" stroke-width="5" stroke-linecap="round"/>
   <path d="M28 12 H100 C103 42 92 70 64 76 C36 70 25 42 28 12 Z" fill="none" stroke="#77767b" stroke-width="3" stroke-linejoin="round"/>
 </svg>
