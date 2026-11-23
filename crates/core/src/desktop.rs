@@ -614,7 +614,7 @@ fn escape_desktop_string(text: &str) -> String {
 
 /// Quote a single argument for a `.desktop` `Exec=` line per the Freedesktop
 /// Desktop Entry Specification.
-fn quote(text: &str) -> String {
+pub fn quote(text: &str) -> String {
     let escaped_percent = text.replace('%', "%%");
     if !escaped_percent.is_empty()
         && escaped_percent

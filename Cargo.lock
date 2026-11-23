@@ -1342,6 +1342,7 @@ dependencies = [
  "fl-studio-linux-core",
  "slint",
  "slint-build",
+ "tempfile",
 ]
 
 [[package]]

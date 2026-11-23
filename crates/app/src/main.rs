@@ -1,5 +1,7 @@
 slint::include_modules!();
 
+mod integration;
+
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Write;
@@ -39,9 +41,10 @@ enum UiEvent {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    integration::register();
     let ui = MainWindow::new()?;
     // Matches the desktop file name, so Wayland compositors show its icon.
-    slint::set_xdg_app_id("io.github._360900.FLStudioLinux")?;
+    slint::set_xdg_app_id(integration::APP_ID)?;
     let cfg = Config::load().unwrap_or_else(|err| {
         eprintln!("config: {err:#}");
         Config::default()
