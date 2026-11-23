@@ -135,12 +135,13 @@ diagnostics: `doctor`, `deps`, `wine-setup`.
   services keep running. The watchdog stops the prefix once FL Studio's folder
   has stopped changing for a while.
 - 32-bit plugins are fragile under Wine. Prefer the 64-bit versions.
-- On immutable distributions such as Bazzite, install `winetricks`,
-  `cabextract` and the Wine libraries with `rpm-ostree` first. The installer
-  warns and continues when no package plan exists, but fonts need winetricks.
-- Run the installer as your normal user. It asks for elevation only when it
-  installs system packages; running the whole app with `sudo` would create the
-  prefix and menu entries in root's home.
+- On immutable distributions such as Bazzite, SteamOS or openSUSE Aeon, and
+  on distributions without a package plan, install `winetricks`, `cabextract`,
+  `7z` and the Wine libraries yourself first. The installer stops while one of
+  its required tools is missing.
+- Run the app as your normal user; it refuses to run as root. It asks for
+  elevation only when it installs system packages. Without a polkit agent,
+  run `fl-studio-linux deps` in a terminal to install them with sudo.
 
 ## Files
 

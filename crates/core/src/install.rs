@@ -540,7 +540,9 @@ fn install_dependencies(opts: &SetupOptions, report: &mut Report<'_>) -> Result<
         bail!("sudo is missing; install the dependencies manually or run as root");
     }
     if elevation == Elevation::Pkexec && deps::which("pkexec").is_none() {
-        bail!("pkexec is missing; install the dependencies manually or run as root");
+        bail!(
+            "pkexec is missing; run `fl-studio-linux deps` in a terminal to install the dependencies with sudo"
+        );
     }
 
     let options = PlanRunOptions {

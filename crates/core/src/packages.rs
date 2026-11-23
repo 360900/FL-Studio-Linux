@@ -249,13 +249,32 @@ pub enum Elevation {
 }
 
 pub fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|out| out.trim() == "0")
-        .unwrap_or(false)
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|meta| meta.uid() == 0)
+}
+
+/// The prefix, menu entries and config belong to the user. Run as root they
+/// would land in root's home, or leave root-owned files in the user's.
+pub fn ensure_not_root() -> Result<()> {
+    if is_root() {
+        bail!(
+            "run FL Studio Linux as your normal user, not as root or with sudo; it asks for administrator rights itself when it installs system packages"
+        );
+    }
+    Ok(())
+}
+
+/// Advice when polkit refused or could not ask, e.g. without an
+/// authentication agent on a bare window manager.
+fn pkexec_failure(result: &runner::RunResult) -> Option<String> {
+    let lines = result.stderr_tail.iter().chain(&result.stdout_tail);
+    let reason = lines
+        .filter_map(|line| line.split_once("Error executing command as another user:"))
+        .map(|(_, reason)| reason.trim().to_string())
+        .next_back()?;
+    Some(format!(
+        "could not get administrator rights through polkit ({reason}). Run `fl-studio-linux deps` in a terminal to install the packages with sudo, then install again"
+    ))
 }
 
 pub fn default_elevation() -> Elevation {
@@ -346,6 +365,13 @@ where
         }
 
         let result = runner::run(cmd, run_opts, &mut on_line)?;
+        if !result.success()
+            && step.needs_root
+            && opts.elevation == Elevation::Pkexec
+            && let Some(advice) = pkexec_failure(&result)
+        {
+            bail!("{advice}");
+        }
         if !result.success() {
             let detail = result.tail_text(15);
             if step.optional {
@@ -416,6 +442,9 @@ where
     })?;
 
     if !result.success() {
+        if let Some(advice) = pkexec_failure(&result) {
+            bail!("{advice}");
+        }
         bail!("package installation failed\n{}", result.tail_text(15));
     }
 
@@ -593,6 +622,25 @@ mod tests {
         assert!(script.contains("==> [3/3]"));
         assert!(script.contains("|| exit $?"));
         assert!(script.contains(OPT_FAIL_MARKER));
+    }
+
+    #[test]
+    fn explains_polkit_failures() {
+        use std::os::unix::process::ExitStatusExt;
+        let result = |line: &str| runner::RunResult {
+            status: std::process::ExitStatus::from_raw(127 << 8),
+            stalled: false,
+            cancelled: false,
+            stdout_tail: Vec::new(),
+            stderr_tail: vec![line.to_string()],
+        };
+        let advice = pkexec_failure(&result(
+            "Error executing command as another user: No authentication agent found.",
+        ))
+        .unwrap();
+        assert!(advice.contains("No authentication agent found"));
+        assert!(advice.contains("fl-studio-linux deps"));
+        assert!(pkexec_failure(&result("sh: apt-get: not found")).is_none());
     }
 
     #[test]

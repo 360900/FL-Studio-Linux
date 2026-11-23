@@ -387,6 +387,7 @@ fn spawn_install(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "install");
         let result = (|| -> anyhow::Result<Vec<String>> {
+            packages::ensure_not_root()?;
             validate_prefix(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
             let mut send = |stream: Stream, line: &str| {
@@ -452,6 +453,7 @@ fn spawn_update(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "update");
         let result = (|| -> anyhow::Result<Vec<String>> {
+            packages::ensure_not_root()?;
             validate_prefix(&prefix)?;
             install::ensure_installed(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
@@ -518,6 +520,7 @@ fn spawn_repair(cfg: Config, display: DisplayInfo, tx: Sender<UiEvent>) {
         let prefix = cfg.prefix.clone();
         let log_path = job_log(&prefix, "repair");
         let result = (|| -> anyhow::Result<Vec<String>> {
+            packages::ensure_not_root()?;
             validate_prefix(&prefix)?;
             install::ensure_installed(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
@@ -561,6 +564,7 @@ fn spawn_launch(cfg: Config, tx: Sender<UiEvent>) {
         let prefix = cfg.prefix.clone();
         let log_path = prefix.join("logs/launch.log");
         let result = (|| -> anyhow::Result<launch::LaunchOutcome> {
+            packages::ensure_not_root()?;
             validate_prefix(&prefix)?;
             install::ensure_installed(&prefix)?;
             fs::create_dir_all(prefix.join("logs"))?;
@@ -598,6 +602,10 @@ fn spawn_uninstall(cfg: Config, tx: Sender<UiEvent>) {
     std::thread::spawn(move || {
         let prefix = cfg.prefix.clone();
         let log_path = cache_log("uninstall");
+        if let Err(error) = packages::ensure_not_root() {
+            job_failed(&tx, "uninstall", &log_path, &error);
+            return;
+        }
         let options = uninstall::UninstallOptions {
             prefix,
             dry_run: false,

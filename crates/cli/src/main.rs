@@ -172,6 +172,9 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !matches!(cli.command, Command::Doctor { .. } | Command::Deps { .. }) {
+        packages::ensure_not_root()?;
+    }
     let cfg = Config::load()?;
 
     match cli.command {
@@ -869,16 +872,23 @@ fn run_deps(cfg: &Config, dry_run: bool, yes: bool, pkexec: bool) -> Result<()> 
         _ => {}
     }
 
-    validate_prefix(&cfg.prefix)?;
-    let log_dir = cfg.prefix.join("logs");
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("deps-{}.log", now_epoch()));
-    println!("log     {}", log_path.display());
+    // As root, a log in the prefix would leave root-owned files in the
+    // user's folder, so only the terminal gets the output.
+    let log_path = if packages::is_root() {
+        None
+    } else {
+        validate_prefix(&cfg.prefix)?;
+        let log_dir = cfg.prefix.join("logs");
+        fs::create_dir_all(&log_dir)?;
+        let log_path = log_dir.join(format!("deps-{}.log", now_epoch()));
+        println!("log     {}", log_path.display());
+        Some(log_path)
+    };
 
     let options = PlanRunOptions {
         dry_run: false,
         elevation,
-        log_path: Some(log_path),
+        log_path,
     };
     let outcome = packages::run_plan(&plan, &options, print_line)?;
     println!("completed {} steps", outcome.completed.len());
