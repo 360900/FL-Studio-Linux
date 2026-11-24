@@ -306,7 +306,7 @@ fn display_info(ui: &MainWindow) -> DisplayInfo {
 /// Picks the Wine DPI for the display and logs how it was chosen.
 fn display_dpi(display: DisplayInfo, tx: &Sender<UiEvent>, log_path: &Path) -> u32 {
     let x = wine::detect_x_scaling(display.resolution, display.scale);
-    let dpi = wine::recommended_dpi(display.resolution, display.scale, x);
+    let dpi = wine::recommended_dpi(display.scale, x);
     let resolution = display
         .resolution
         .map(|(width, height)| format!("{width}x{height}"))

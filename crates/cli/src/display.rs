@@ -34,7 +34,7 @@ pub fn detect_dpi() -> Option<(u32, String)> {
         .into_iter()
         .map(|monitor| {
             let x = wine::detect_x_scaling(Some(monitor.resolution), monitor.scale);
-            let dpi = wine::recommended_dpi(Some(monitor.resolution), monitor.scale, x);
+            let dpi = wine::recommended_dpi(monitor.scale, x);
             let (width, height) = monitor.resolution;
             let summary = format!(
                 "{dpi} ({width}x{height} at {:.2}x scale, {})",

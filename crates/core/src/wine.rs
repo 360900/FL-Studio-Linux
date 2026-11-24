@@ -899,23 +899,15 @@ fn parse_geometry(token: &str) -> Option<(u32, u32)> {
 }
 
 /// Wine DPI for a display, in the 12-DPI steps of Wine's scaling slider.
-/// With physical pixels it is the larger of a resolution-based value and the
-/// host scale. `resolution` is the monitor's physical size; without it only
-/// the scale counts.
-pub fn recommended_dpi(resolution: Option<(u32, u32)>, scale: f32, x: XScaling) -> u32 {
-    match x {
-        XScaling::Physical => {}
+/// It follows the host scale, so FL Studio matches the rest of the desktop.
+pub fn recommended_dpi(scale: f32, x: XScaling) -> u32 {
+    let scale = match x {
+        XScaling::Physical => f64::from(scale),
         XScaling::Upscaled => return 96,
         XScaling::RoundedUp => return (96 * scale.ceil().max(1.0) as u32).min(480),
-    }
-    let by_resolution = match resolution {
-        Some((width, height)) if width >= 3840 || height >= 2160 => 192,
-        Some((width, height)) if width >= 2560 || height >= 1440 => 144,
-        _ => 96,
     };
-    let steps = (96.0 * f64::from(scale) / 12.0).round() as u32;
-    let by_scale = (steps * 12).clamp(96, 480);
-    by_resolution.max(by_scale)
+    let steps = (96.0 * scale / 12.0).round() as u32;
+    (steps * 12).clamp(96, 480)
 }
 
 fn stream_opts(stall: Option<Duration>) -> RunOptions {
@@ -966,29 +958,22 @@ mod tests {
     }
 
     #[test]
-    fn dpi_follows_resolution_and_scale() {
+    fn dpi_follows_host_scale() {
         let physical = XScaling::Physical;
-        assert_eq!(recommended_dpi(Some((3840, 2400)), 2.25, physical), 216);
-        assert_eq!(recommended_dpi(Some((3840, 2160)), 1.0, physical), 192);
-        assert_eq!(recommended_dpi(Some((2560, 1440)), 1.25, physical), 144);
-        assert_eq!(recommended_dpi(Some((1920, 1080)), 1.0, physical), 96);
-        assert_eq!(recommended_dpi(None, 1.5, physical), 144);
-        assert_eq!(recommended_dpi(None, 0.5, physical), 96);
-        assert_eq!(recommended_dpi(None, 8.0, physical), 480);
+        assert_eq!(recommended_dpi(2.25, physical), 216);
+        assert_eq!(recommended_dpi(1.0, physical), 96);
+        assert_eq!(recommended_dpi(1.25, physical), 120);
+        assert_eq!(recommended_dpi(1.5, physical), 144);
+        assert_eq!(recommended_dpi(0.5, physical), 96);
+        assert_eq!(recommended_dpi(8.0, physical), 480);
     }
 
     #[test]
     fn dpi_on_gnome_follows_how_mutter_scales_xwayland() {
-        assert_eq!(
-            recommended_dpi(Some((3840, 2400)), 2.0, XScaling::Upscaled),
-            96
-        );
-        assert_eq!(
-            recommended_dpi(Some((2560, 1600)), 1.25, XScaling::RoundedUp),
-            192
-        );
-        assert_eq!(recommended_dpi(None, 1.0, XScaling::RoundedUp), 96);
-        assert_eq!(recommended_dpi(None, 2.5, XScaling::RoundedUp), 288);
+        assert_eq!(recommended_dpi(2.0, XScaling::Upscaled), 96);
+        assert_eq!(recommended_dpi(1.25, XScaling::RoundedUp), 192);
+        assert_eq!(recommended_dpi(1.0, XScaling::RoundedUp), 96);
+        assert_eq!(recommended_dpi(2.5, XScaling::RoundedUp), 288);
     }
 
     #[test]
